@@ -229,3 +229,9 @@ The finished control feels simple because all of those layers are doing their jo
 ## A note about Ember
 
 This is an unofficial personal project. It is not affiliated with or endorsed by Ember. It relies on the reverse-engineered Bluetooth work in `python-ember-mug` and the local control interface provided by `ember-mug-app`.
+
+## TL;DR
+
+I wanted to control my Ember Mug with a Stream Deck dial. The first Python library could change the temperature, but reconnecting to the mug for every command was unreliable. I used a macOS menu-bar app to keep the Bluetooth connection running, then built this Stream Deck plugin to send commands to that app.
+
+Turning the dial moves between **120°F, 130°F, 140°F, and 145°F**. Pressing it turns heating off, and pressing it again turns heating back on at my default of **145°F**. The Stream Deck screen also shows the mug's battery percentage and whether it is charging.
