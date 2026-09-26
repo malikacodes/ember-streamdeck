@@ -10,13 +10,13 @@
         "layout": "layouts/temperature.json",
         "TriggerDescription": {
           "Rotate": "Choose temperature",
-          "Push": "Heating on / off"
+          "Push": "Toggle heating · hold to reconnect"
         }
       },
       "States": [{ "Image": "imgs/ember" }]
     }
   ],
-  "Author": "Ember Mug",
+  "Author": "malikacodes",
   "CodePath": "plugin.py",
   "Description": "Control an Ember Mug from a Stream Deck dial.",
   "Icon": "imgs/ember",

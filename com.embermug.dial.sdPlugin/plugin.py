@@ -6,24 +6,31 @@ import os
 from pathlib import Path
 import socket
 import struct
+import subprocess
 import sys
 import time
 
-PRESETS = [120, 130, 140, 145]
+PRESETS = [120, 130, 140, 145] # Preset temperature values in Fahrenheit
+HOLD_SECONDS = 1.5
+RECONNECT_TIMEOUT_SECONDS = 30
+CONNECTED_MESSAGE_SECONDS = 3
 SUPPORT = Path.home() / "Library/Application Support/EmberMug"
-STATUS = SUPPORT / "status.json"
-COMMAND = SUPPORT / "command.json"
-selected = None
-last_action = 0.0
+STATUS = SUPPORT / "status.json" # Mug data read from the Ember menu-bar app
+COMMAND = SUPPORT / "command.json" # Commands to control the Ember menu-bar app
+EMBER_APP = Path.home() / "Applications/Ember Mug.app"
+selected = None # Current dial preset; none until the plugin initializes
+last_action = 0.0  # Time of the most recent dial action
 
 
 def atomic_json(path, value):
+    # Make sure the destination folder exists before writing
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(value), encoding="utf-8")
-    temp.replace(path)
+    temp.replace(path) # Atomically replace the official file with the completed temporary file
 
 
+# Read the latest mug status written by the Ember menu-bar app
 def status():
     try:
         return json.loads(STATUS.read_text(encoding="utf-8"))
@@ -39,6 +46,13 @@ def target_f():
 def set_temp(fahrenheit):
     celsius = (fahrenheit - 32) * 5 / 9 if fahrenheit else 0
     atomic_json(COMMAND, {"cmd": "set_temp", "temp_c": celsius})
+
+
+def request_reconnect():
+    # The menu-bar app only reads command.json while connected, so its
+    # "takeback" command cannot wake an offline app. Opening the app runs its
+    # launcher, which replaces the stuck process and starts a fresh connection.
+    subprocess.Popen(["open", str(EMBER_APP)])
 
 
 class WebSocket:
@@ -124,6 +138,10 @@ def feedback(ws, context, override=None):
     ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, "value": value}})
 
 
+def message_feedback(ws, context, title, value):
+    ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, "value": value}})
+
+
 def sync_selection():
     global selected
     actual = target_f()
@@ -138,6 +156,11 @@ def main():
     ws = WebSocket(port)
     ws.send({"event": register_event, "uuid": plugin_uuid})
     contexts = set()
+    # Stream Deck gives each placed action its own context. Keeping one start
+    # time per context prevents presses on different dials from interfering.
+    press_started = {}
+    reconnect_requested_at = None
+    connected_message_until = 0.0
     last_update = 0.0
     while True:
         try:
@@ -153,28 +176,72 @@ def main():
                 feedback(ws, context, selected)
             elif name == "willDisappear" and context:
                 contexts.discard(context)
+                press_started.pop(context, None)
             elif name == "dialRotate" and context:
                 ticks = int(event.get("payload", {}).get("ticks", 0))
                 if ticks:
-                    if selected not in PRESETS:
-                        sync_selection()
-                    index = PRESETS.index(selected)
-                    index = max(0, min(len(PRESETS) - 1, index + ticks))
+                    if selected in PRESETS:
+                        index = PRESETS.index(selected) + ticks
+                    else:
+                        # Heating off is outside the preset list. Clockwise
+                        # enters at 120°F; counterclockwise enters at 145°F.
+                        index = (-1 if ticks > 0 else len(PRESETS)) + ticks
+                    index = max(0, min(len(PRESETS) - 1, index))
                     selected = PRESETS[index]
                     last_action = time.time()
                     set_temp(selected)
                     feedback(ws, context, selected)
             elif name == "dialDown" and context:
-                selected = 0 if selected and selected >= 1 else 145
+                # Do not toggle heating yet. We must wait for dial-up so a
+                # quick press can be distinguished from a reconnect hold.
+                press_started[context] = time.monotonic()
+            elif name == "dialUp" and context:
+                started = press_started.pop(context, None)
+                if started is None:
+                    continue
+                held_for = time.monotonic() - started
                 last_action = time.time()
-                set_temp(selected)
-                feedback(ws, context, selected)
+                if held_for >= HOLD_SECONDS:
+                    request_reconnect()
+                    # Wait for a status update newer than this request. That
+                    # prevents stale "connected" data from confirming too soon.
+                    reconnect_requested_at = time.time()
+                    message_feedback(ws, context, "RECONNECTING…", "…")
+                else:
+                    # A short press keeps the original behavior: turn heating
+                    # off, or turn it back on at the default of 145°F.
+                    selected = 0 if selected and selected >= 1 else 145
+                    set_temp(selected)
+                    feedback(ws, context, selected)
         if time.time() - last_update >= 2:
-            if time.time() - last_action > 3:
+            now = time.time()
+            current_status = status()
+            if reconnect_requested_at is not None:
+                status_is_fresh = float(current_status.get("updated_ts", 0)) >= reconnect_requested_at
+                if current_status.get("connected") and status_is_fresh:
+                    reconnect_requested_at = None
+                    connected_message_until = now + CONNECTED_MESSAGE_SECONDS
+                    sync_selection()
+                elif now - reconnect_requested_at >= RECONNECT_TIMEOUT_SECONDS:
+                    # Stop showing an endless reconnect message. The normal
+                    # feedback will explain that the mug is still offline.
+                    reconnect_requested_at = None
+                else:
+                    for context in list(contexts):
+                        message_feedback(ws, context, "RECONNECTING…", "…")
+                    last_update = now
+                    continue
+            if now < connected_message_until:
+                value = "OFF" if not selected else f"{selected}°F"
+                for context in list(contexts):
+                    message_feedback(ws, context, "CONNECTED", value)
+                last_update = now
+                continue
+            if now - last_action > 3:
                 sync_selection()
             for context in list(contexts):
                 feedback(ws, context, selected)
-            last_update = time.time()
+            last_update = now
 
 
 if __name__ == "__main__":
