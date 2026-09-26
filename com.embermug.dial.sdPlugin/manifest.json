@@ -1,0 +1,29 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "Actions": [
+    {
+      "UUID": "com.embermug.dial.temperature",
+      "Name": "Ember Temperature",
+      "Icon": "imgs/ember",
+      "Controllers": ["Encoder"],
+      "Encoder": {
+        "layout": "layouts/temperature.json",
+        "TriggerDescription": {
+          "Rotate": "Choose temperature",
+          "Push": "Heating on / off"
+        }
+      },
+      "States": [{ "Image": "imgs/ember" }]
+    }
+  ],
+  "Author": "Ember Mug",
+  "CodePath": "plugin.py",
+  "Description": "Control an Ember Mug from a Stream Deck dial.",
+  "Icon": "imgs/ember",
+  "Name": "Ember Mug",
+  "OS": [{ "Platform": "mac", "MinimumVersion": "12" }],
+  "SDKVersion": 2,
+  "Software": { "MinimumVersion": "6.5" },
+  "UUID": "com.embermug.dial",
+  "Version": "1.0.0.0"
+}
