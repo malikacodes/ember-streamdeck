@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -14,6 +15,7 @@ PRESETS = [120, 130, 140, 145] # Preset temperature values in Fahrenheit
 HOLD_SECONDS = 1.5
 RECONNECT_TIMEOUT_SECONDS = 30
 CONNECTED_MESSAGE_SECONDS = 3
+STATUS_STALE_SECONDS = 300
 SUPPORT = Path.home() / "Library/Application Support/EmberMug"
 STATUS = SUPPORT / "status.json" # Mug data read from the Ember menu-bar app
 COMMAND = SUPPORT / "command.json" # Commands to control the Ember menu-bar app
@@ -33,14 +35,37 @@ def atomic_json(path, value):
 # Read the latest mug status written by the Ember menu-bar app
 def status():
     try:
-        return json.loads(STATUS.read_text(encoding="utf-8"))
+        value = json.loads(STATUS.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
+def finite_number(value):
+    """Return a usable finite number, or None for malformed status data."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def target_f():
-    value = status().get("target_f")
-    return float(value) if value is not None else 0.0
+    value = finite_number(status().get("target_f"))
+    return value if value is not None else 0.0
+
+
+def status_is_stale(state, now=None):
+    """Return whether a claimed connection is backed by a recent update."""
+    if state.get("connected") is not True:
+        return False
+    updated_at = finite_number(state.get("updated_ts"))
+    if updated_at is None:
+        return True
+    now = time.time() if now is None else now
+    return now - updated_at > STATUS_STALE_SECONDS
 
 
 def set_temp(fahrenheit):
@@ -52,6 +77,8 @@ def request_reconnect():
     # The menu-bar app only reads command.json while connected, so its
     # "takeback" command cannot wake an offline app. Opening the app runs its
     # launcher, which replaces the stuck process and starts a fresh connection.
+    if not EMBER_APP.is_dir():
+        raise FileNotFoundError(f"Ember app not found: {EMBER_APP}")
     subprocess.Popen(["open", str(EMBER_APP)])
 
 
@@ -90,9 +117,8 @@ class WebSocket:
         self.sock.sendall(header + body)
 
     def receive(self):
-        first = self.sock.recv(2)
-        if not first:
-            raise EOFError
+        # TCP is allowed to split even this two-byte header across reads.
+        first = self._read(2)
         opcode = first[0] & 0x0F
         length = first[1] & 0x7F
         if length == 126:
@@ -110,7 +136,10 @@ class WebSocket:
     def _read(self, count):
         data = b""
         while len(data) < count:
-            data += self.sock.recv(count - len(data))
+            chunk = self.sock.recv(count - len(data))
+            if not chunk:
+                raise EOFError
+            data += chunk
         return data
 
     def send_raw(self, opcode, payload):
@@ -126,12 +155,12 @@ def arg(flag):
 
 def feedback(ws, context, override=None):
     state = status()
-    connected = bool(state.get("connected"))
+    connected = state.get("connected") is True and not status_is_stale(state)
     target = target_f() if override is None else override
     value = "OFF" if target < 1 else f"{round(target):d}°F"
-    battery = state.get("battery_percent")
+    battery = finite_number(state.get("battery_percent"))
     if connected and battery is not None:
-        charging = " ⚡" if state.get("charging") else ""
+        charging = " ⚡" if state.get("charging") is True else ""
         title = f"EMBER · {round(float(battery))}%{charging}"
     else:
         title = "EMBER" if connected else "EMBER · OFFLINE"
@@ -140,6 +169,16 @@ def feedback(ws, context, override=None):
 
 def message_feedback(ws, context, title, value):
     ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, "value": value}})
+
+
+def send_temp_command(ws, context, fahrenheit):
+    """Write a mug command without allowing a filesystem error to kill the plugin."""
+    try:
+        set_temp(fahrenheit)
+    except OSError:
+        message_feedback(ws, context, "COMMAND FAILED", "TRY AGAIN")
+        return False
+    return True
 
 
 def sync_selection():
@@ -159,7 +198,10 @@ def main():
     # Stream Deck gives each placed action its own context. Keeping one start
     # time per context prevents presses on different dials from interfering.
     press_started = {}
+    # Status timestamps use wall time, while elapsed UI timers use monotonic
+    # time so clock corrections cannot stretch or shorten them.
     reconnect_requested_at = None
+    reconnect_started_at = None
     connected_message_until = 0.0
     last_update = 0.0
     while True:
@@ -167,6 +209,7 @@ def main():
             event = ws.receive()
         except socket.timeout:
             event = None
+        now = time.monotonic()
         if event:
             name = event.get("event")
             context = event.get("context")
@@ -187,45 +230,63 @@ def main():
                         # enters at 120°F; counterclockwise enters at 145°F.
                         index = (-1 if ticks > 0 else len(PRESETS)) + ticks
                     index = max(0, min(len(PRESETS) - 1, index))
-                    selected = PRESETS[index]
-                    last_action = time.time()
-                    set_temp(selected)
+                    new_selection = PRESETS[index]
+                    if not send_temp_command(ws, context, new_selection):
+                        last_update = now
+                        continue
+                    selected = new_selection
+                    last_action = now
                     feedback(ws, context, selected)
             elif name == "dialDown" and context:
                 # Do not toggle heating yet. We must wait for dial-up so a
                 # quick press can be distinguished from a reconnect hold.
-                press_started[context] = time.monotonic()
+                press_started[context] = now
             elif name == "dialUp" and context:
                 started = press_started.pop(context, None)
                 if started is None:
                     continue
-                held_for = time.monotonic() - started
-                last_action = time.time()
+                held_for = now - started
+                last_action = now
                 if held_for >= HOLD_SECONDS:
-                    request_reconnect()
+                    try:
+                        request_reconnect()
+                    except FileNotFoundError:
+                        message_feedback(ws, context, "APP NOT FOUND", "REINSTALL APP")
+                        last_update = now
+                        continue
+                    except OSError:
+                        message_feedback(ws, context, "RECONNECT FAILED", "TRY AGAIN")
+                        last_update = now
+                        continue
                     # Wait for a status update newer than this request. That
                     # prevents stale "connected" data from confirming too soon.
                     reconnect_requested_at = time.time()
+                    reconnect_started_at = now
                     message_feedback(ws, context, "RECONNECTING…", "…")
                 else:
                     # A short press keeps the original behavior: turn heating
                     # off, or turn it back on at the default of 145°F.
-                    selected = 0 if selected and selected >= 1 else 145
-                    set_temp(selected)
+                    new_selection = 0 if selected and selected >= 1 else 145
+                    if not send_temp_command(ws, context, new_selection):
+                        last_update = now
+                        continue
+                    selected = new_selection
                     feedback(ws, context, selected)
-        if time.time() - last_update >= 2:
-            now = time.time()
+        if now - last_update >= 2:
             current_status = status()
             if reconnect_requested_at is not None:
-                status_is_fresh = float(current_status.get("updated_ts", 0)) >= reconnect_requested_at
-                if current_status.get("connected") and status_is_fresh:
+                updated_at = finite_number(current_status.get("updated_ts")) or 0.0
+                status_is_fresh = updated_at >= reconnect_requested_at
+                if current_status.get("connected") is True and status_is_fresh:
                     reconnect_requested_at = None
+                    reconnect_started_at = None
                     connected_message_until = now + CONNECTED_MESSAGE_SECONDS
                     sync_selection()
-                elif now - reconnect_requested_at >= RECONNECT_TIMEOUT_SECONDS:
+                elif now - reconnect_started_at >= RECONNECT_TIMEOUT_SECONDS:
                     # Stop showing an endless reconnect message. The normal
                     # feedback will explain that the mug is still offline.
                     reconnect_requested_at = None
+                    reconnect_started_at = None
                 else:
                     for context in list(contexts):
                         message_feedback(ws, context, "RECONNECTING…", "…")
