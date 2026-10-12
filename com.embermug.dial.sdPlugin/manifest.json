@@ -9,21 +9,23 @@
       "Encoder": {
         "layout": "layouts/temperature.json",
         "TriggerDescription": {
-          "Rotate": "Choose temperature",
-          "Push": "Toggle heating · hold to reconnect"
+          "Rotate": "Set temperature",
+          "Push": "On/off · Hold: reconnect"
         }
       },
       "States": [{ "Image": "imgs/ember" }]
     }
   ],
   "Author": "malikacodes",
+  "Category": "Ember Mug",
+  "CategoryIcon": "imgs/category-icon",
   "CodePath": "plugin.py",
   "Description": "Control an Ember Mug from a Stream Deck dial.",
-  "Icon": "imgs/ember",
+  "Icon": "imgs/plugin-icon",
   "Name": "Ember Mug",
   "OS": [{ "Platform": "mac", "MinimumVersion": "12" }],
   "SDKVersion": 2,
   "Software": { "MinimumVersion": "6.5" },
   "UUID": "com.embermug.dial",
-  "Version": "1.0.0.0"
+  "Version": "1.1.0.0"
 }

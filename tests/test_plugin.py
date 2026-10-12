@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import struct
 from unittest.mock import Mock
 
@@ -87,6 +88,41 @@ def test_manifest_references_files_that_exist():
         assert (PLUGIN_ROOT / action["Encoder"]["layout"]).is_file()
         for state in action["States"]:
             assert resolve_extensionless_asset(state["Image"])
+
+
+def test_manifest_identity_and_version_are_well_formed():
+    manifest = load_manifest()
+
+    assert manifest["UUID"] == "com.embermug.dial"
+    assert manifest["Category"] == manifest["Name"]
+    assert all(action["UUID"].startswith(f'{manifest["UUID"]}.') for action in manifest["Actions"])
+    assert re.fullmatch(r"\d+\.\d+\.\d+\.\d+", manifest["Version"])
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_size"),
+    [(".png", (256, 256)), ("@2x.png", (512, 512))],
+)
+def test_manifest_plugin_icon_uses_required_png_sizes(suffix, expected_size):
+    icon_path = PLUGIN_ROOT / f'{load_manifest()["Icon"]}{suffix}'
+    header = icon_path.read_bytes()[:24]
+
+    assert header[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", header[16:24]) == expected_size
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_size"),
+    [(".png", (28, 28)), ("@2x.png", (56, 56))],
+)
+def test_manifest_category_has_required_icon_sizes(suffix, expected_size):
+    manifest = load_manifest()
+    icon_path = PLUGIN_ROOT / f'{manifest["CategoryIcon"]}{suffix}'
+    header = icon_path.read_bytes()[:24]
+
+    assert manifest["Category"] == manifest["Name"]
+    assert header[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", header[16:24]) == expected_size
 
 
 def test_manifest_documents_macos_12_or_newer():

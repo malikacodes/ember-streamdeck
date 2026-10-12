@@ -181,13 +181,17 @@ com.embermug.dial.sdPlugin/
 ├── layouts/
 │   └── temperature.json
 └── imgs/
-    └── ember.svg
+    ├── ember.svg
+    ├── category-icon.png / category-icon@2x.png
+    └── plugin-icon.png / plugin-icon@2x.png
 ```
 
 - `manifest.json` tells Stream Deck the plugin's name, ID, supported controls, entry point, and display layout.
 - `plugin.py` listens for dial events, reads mug status, writes commands, and updates the display.
 - `layouts/temperature.json` defines the text-only touch-screen layout.
-- `imgs/ember.svg` is used in Stream Deck's action list, not on the physical dial display.
+- `imgs/ember.svg` is used for the action artwork, not on the physical dial display.
+- `imgs/category-icon.png` and `imgs/category-icon@2x.png` identify the Ember Mug group in Stream Deck's action list.
+- `imgs/plugin-icon.png` and `imgs/plugin-icon@2x.png` are the two plugin-icon sizes required by Stream Deck.
 
 ## Requirements
 
