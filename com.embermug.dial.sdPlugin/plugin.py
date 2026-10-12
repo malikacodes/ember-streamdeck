@@ -13,6 +13,8 @@ import time
 
 PRESETS = [120, 130, 140, 145] # Preset temperature values in Fahrenheit
 HOLD_SECONDS = 1.5
+TARGET_PREVIEW_SECONDS = 1.5
+CHECKMARK_SECONDS = 3
 RECONNECT_TIMEOUT_SECONDS = 30
 CONNECTED_MESSAGE_SECONDS = 3
 STATUS_STALE_SECONDS = 300
@@ -97,7 +99,9 @@ class WebSocket:
         expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         if b"101" not in response.split(b"\r\n", 1)[0] or expected not in response:
             raise RuntimeError("Stream Deck WebSocket handshake failed")
-        self.sock.settimeout(1)
+        # A short timeout lets the display leave target-preview mode close to
+        # 1.5 seconds after the last dial turn, even when no new event arrives.
+        self.sock.settimeout(0.25)
 
     def send(self, value):
         payload = json.dumps(value, separators=(",", ":")).encode()
@@ -117,7 +121,9 @@ class WebSocket:
         self.sock.sendall(header + body)
 
     def receive(self):
-        # TCP is allowed to split even this two-byte header across reads.
+        # TCP may split even this two-byte header across multiple reads. Use
+        # the same exact-length reader as the rest of the frame instead of
+        # assuming recv(2) always returns both bytes together.
         first = self._read(2)
         opcode = first[0] & 0x0F
         length = first[1] & 0x7F
@@ -138,6 +144,8 @@ class WebSocket:
         while len(data) < count:
             chunk = self.sock.recv(count - len(data))
             if not chunk:
+                # The connection ended before the complete frame arrived.
+                # Treat it as a normal disconnect rather than looping forever.
                 raise EOFError
             data += chunk
         return data
@@ -153,22 +161,110 @@ def arg(flag):
     return sys.argv[sys.argv.index(flag) + 1]
 
 
-def feedback(ws, context, override=None):
+def is_at_target(state, target):
+    current = finite_number(state.get("current_f"))
+    target = finite_number(target)
+    return current is not None and target is not None and target >= 1 and abs(current - target) <= 1
+
+
+def temperature_display(state, target, target_only=False, show_check=False):
+    """Build the separate display fields used on the Stream Deck dial."""
+    current = finite_number(state.get("current_f"))
+    target = finite_number(target)
+    target = target if target is not None else 0.0
+    target_text = "OFF" if target < 1 else f"{round(target):d}°"
+    fields = {
+        "value": {"value": target_text, "enabled": True},
+        "current": {"value": "", "enabled": False},
+        "trend": {"value": "", "enabled": False},
+        "target": {"value": "", "enabled": False},
+    }
+
+    # Heating off has its own uncluttered interface. OFF is a mode, not a
+    # temperature target, so do not show the current temperature or an arrow.
+    if target < 1:
+        return fields
+
+    # While the dial is turning, keep the chosen target large and uncluttered.
+    if target_only or current is None:
+        return fields
+
+    # Once the drink is at its target, the direction marker is no longer useful.
+    if is_at_target(state, target):
+        fields["value"]["value"] = f"{round(target):d}°  ✓" if show_check else target_text
+        return fields
+
+    fields["value"]["enabled"] = False
+    fields["current"] = {"value": f"{round(current):d}°", "enabled": True}
+    fields["target"] = {"value": target_text, "enabled": True}
+
+    # Red points up toward a warmer target; blue points down toward a cooler
+    # target (or toward OFF). Keeping this symbol small prevents truncation.
+    warming = current < target
+    fields["trend"] = {
+        "value": "▲" if warming else "▼",
+        "color": "#FF5A5F" if warming else "#3B9CFF",
+        "enabled": True,
+    }
+    return fields
+
+
+def temperature_value(state, target):
+    """Plain-text fallback used by short reconnect status messages."""
+    current = finite_number(state.get("current_f"))
+    target = finite_number(target)
+    target = target if target is not None else 0.0
+    if is_at_target(state, target):
+        return f"{round(target):d}°  ✓"
+    current_text = "—" if current is None else f"{round(current):d}°"
+    target_text = "OFF" if target < 1 else f"{round(target):d}°"
+    return f"{current_text}  {target_text}"
+
+
+def feedback(ws, context, override=None, target_only=False, show_check=False):
     state = status()
     connected = state.get("connected") is True and not status_is_stale(state)
     target = target_f() if override is None else override
-    value = "OFF" if target < 1 else f"{round(target):d}°F"
     battery = finite_number(state.get("battery_percent"))
     if connected and battery is not None:
         charging = " ⚡" if state.get("charging") is True else ""
-        title = f"EMBER · {round(float(battery))}%{charging}"
+        label = state.get("liquid_state_label")
+        mug_state = label.strip().upper() if isinstance(label, str) and label.strip() else "CONNECTED"
+        if mug_state == "UNKNOWN":
+            # The Ember app can briefly report UNKNOWN before its first full
+            # status update. The Bluetooth connection is already real, so use
+            # the useful connection label until a meaningful state arrives.
+            mug_state = "CONNECTED"
+        elif mug_state == "WARM (NO CONTROL)" and target >= 1:
+            # Immediately after heating is enabled, the app can briefly keep
+            # its previous no-control label. The temperatures already tell us
+            # the useful direction while the app catches up.
+            current = finite_number(state.get("current_f"))
+            if current is None:
+                mug_state = "CONNECTED"
+            elif current < target - 1:
+                mug_state = "HEATING"
+            elif current > target + 1:
+                mug_state = "COOLING"
+            else:
+                mug_state = "PERFECT"
+        title_state = "CONNECTED" if target < 1 else mug_state
+        title = f"{title_state} · {round(float(battery))}%{charging}"
+        display = temperature_display(state, target, target_only, show_check)
     else:
-        title = "EMBER" if connected else "EMBER · OFFLINE"
-    ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, "value": value}})
+        title = "CONNECTED" if connected else "OFFLINE"
+        display = temperature_display(state, target) if connected else temperature_display({}, target)
+    ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, **display}})
 
 
 def message_feedback(ws, context, title, value):
-    ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, "value": value}})
+    display = {
+        "value": {"value": value, "enabled": True},
+        "current": {"value": "", "enabled": False},
+        "trend": {"value": "", "enabled": False},
+        "target": {"value": "", "enabled": False},
+    }
+    ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, **display}})
 
 
 def send_temp_command(ws, context, fahrenheit):
@@ -198,11 +294,15 @@ def main():
     # Stream Deck gives each placed action its own context. Keeping one start
     # time per context prevents presses on different dials from interfering.
     press_started = {}
-    # Status timestamps use wall time, while elapsed UI timers use monotonic
-    # time so clock corrections cannot stretch or shorten them.
+    # Keep the wall-clock request time only for comparing status.json's epoch
+    # timestamp. All elapsed-time decisions use the monotonic clock so macOS
+    # clock corrections cannot stretch or shorten UI timers.
     reconnect_requested_at = None
     reconnect_started_at = None
     connected_message_until = 0.0
+    target_preview_until = 0.0
+    checkmark_until = 0.0
+    was_at_target = None
     last_update = 0.0
     while True:
         try:
@@ -216,6 +316,7 @@ def main():
             if name == "willAppear" and context:
                 contexts.add(context)
                 sync_selection()
+                was_at_target = is_at_target(status(), selected)
                 feedback(ws, context, selected)
             elif name == "willDisappear" and context:
                 contexts.discard(context)
@@ -236,7 +337,10 @@ def main():
                         continue
                     selected = new_selection
                     last_action = now
-                    feedback(ws, context, selected)
+                    target_preview_until = last_action + TARGET_PREVIEW_SECONDS
+                    checkmark_until = 0.0
+                    was_at_target = False
+                    feedback(ws, context, selected, target_only=True)
             elif name == "dialDown" and context:
                 # Do not toggle heating yet. We must wait for dial-up so a
                 # quick press can be distinguished from a reconnect hold.
@@ -271,8 +375,35 @@ def main():
                         last_update = now
                         continue
                     selected = new_selection
+                    checkmark_until = 0.0
+                    was_at_target = False
                     feedback(ws, context, selected)
+        if checkmark_until and now >= checkmark_until:
+            # The target-reached check is a brief confirmation, not a
+            # permanent part of the temperature display.
+            checkmark_until = 0.0
+            for context in list(contexts):
+                feedback(ws, context, selected)
+            last_update = now
+            continue
+        if target_preview_until and now >= target_preview_until:
+            # The user has stopped turning the dial. Replace the large target
+            # preview with the live current-temperature-to-target comparison.
+            target_preview_until = 0.0
+            current_status = status()
+            at_target = is_at_target(current_status, selected)
+            if at_target and not was_at_target:
+                checkmark_until = now + CHECKMARK_SECONDS
+            was_at_target = at_target
+            for context in list(contexts):
+                feedback(ws, context, selected, show_check=now < checkmark_until)
+            last_update = now
+            continue
         if now - last_update >= 2:
+            # Do not let the normal refresh overwrite the target preview while
+            # the user is still choosing a preset.
+            if target_preview_until:
+                continue
             current_status = status()
             if reconnect_requested_at is not None:
                 updated_at = finite_number(current_status.get("updated_ts")) or 0.0
@@ -293,15 +424,21 @@ def main():
                     last_update = now
                     continue
             if now < connected_message_until:
-                value = "OFF" if not selected else f"{selected}°F"
+                value = temperature_value(current_status, selected or 0)
                 for context in list(contexts):
                     message_feedback(ws, context, "CONNECTED", value)
                 last_update = now
                 continue
             if now - last_action > 3:
                 sync_selection()
+            at_target = is_at_target(current_status, selected)
+            if at_target and not was_at_target:
+                checkmark_until = now + CHECKMARK_SECONDS
+            elif not at_target:
+                checkmark_until = 0.0
+            was_at_target = at_target
             for context in list(contexts):
-                feedback(ws, context, selected)
+                feedback(ws, context, selected, show_check=now < checkmark_until)
             last_update = now
 
 

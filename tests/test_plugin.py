@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -7,7 +9,13 @@ from unittest.mock import Mock
 import pytest
 
 
-PLUGIN_PATH = Path(__file__).parents[1] / "com.embermug.dial.sdPlugin" / "plugin.py"
+PLUGIN_PATH = (
+    Path(__file__).parents[1]
+    / "com.embermug.dial.sdPlugin"
+    / "plugin.py"
+)
+PLUGIN_ROOT = PLUGIN_PATH.parent
+MANIFEST_PATH = PLUGIN_ROOT / "manifest.json"
 SPEC = importlib.util.spec_from_file_location("ember_streamdeck_plugin", PLUGIN_PATH)
 plugin = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(plugin)
@@ -17,6 +25,7 @@ class FakeSocket:
     def __init__(self, chunks=()):
         self.chunks = list(chunks)
         self.sent = []
+        self.timeout = None
 
     def recv(self, count):
         if not self.chunks:
@@ -30,6 +39,9 @@ class FakeSocket:
     def sendall(self, data):
         self.sent.append(bytes(data))
 
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
 
 class FeedbackSocket:
     def __init__(self):
@@ -39,8 +51,94 @@ class FeedbackSocket:
         self.messages.append(message)
 
 
-def test_plugin_entrypoint_is_executable():
+@pytest.fixture(autouse=True)
+def reset_plugin_state():
+    plugin.selected = None
+    plugin.last_action = 0.0
+
+
+def load_manifest():
+    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def resolve_extensionless_asset(relative_path):
+    path = PLUGIN_ROOT / relative_path
+    return [candidate for suffix in (".svg", ".png") if (candidate := path.with_suffix(suffix)).exists()]
+
+
+def rectangles_overlap(first, second):
+    first_x, first_y, first_width, first_height = first
+    second_x, second_y, second_width, second_height = second
+    return not (
+        first_x + first_width <= second_x
+        or second_x + second_width <= first_x
+        or first_y + first_height <= second_y
+        or second_y + second_height <= first_y
+    )
+
+
+def test_manifest_references_files_that_exist():
+    manifest = load_manifest()
+
+    assert (PLUGIN_ROOT / manifest["CodePath"]).is_file()
+    assert resolve_extensionless_asset(manifest["Icon"])
+    for action in manifest["Actions"]:
+        assert resolve_extensionless_asset(action["Icon"])
+        assert (PLUGIN_ROOT / action["Encoder"]["layout"]).is_file()
+        for state in action["States"]:
+            assert resolve_extensionless_asset(state["Image"])
+
+
+def test_manifest_documents_macos_12_or_newer():
+    manifest = load_manifest()
+    macos = next(entry for entry in manifest["OS"] if entry["Platform"] == "mac")
+
+    assert int(macos["MinimumVersion"].split(".")[0]) >= 12
+
+
+def test_plugin_entrypoint_has_python_shebang():
+    first_line = PLUGIN_PATH.read_text(encoding="utf-8").splitlines()[0]
+
+    assert first_line == "#!/usr/bin/env python3"
+
+
+def test_plugin_entrypoint_is_executable_for_fresh_installs():
     assert PLUGIN_PATH.stat().st_mode & 0o111
+
+
+def test_presets_are_unique_sorted_and_inside_ember_range():
+    assert plugin.PRESETS == sorted(set(plugin.PRESETS))
+    assert all(120 <= preset <= 145 for preset in plugin.PRESETS)
+
+
+def test_layout_keys_are_unique_and_items_stay_inside_dial_canvas():
+    manifest = load_manifest()
+    for action in manifest["Actions"]:
+        layout_path = PLUGIN_ROOT / action["Encoder"]["layout"]
+        layout = json.loads(layout_path.read_text(encoding="utf-8"))
+        items = layout["items"]
+        keys = [item["key"] for item in items]
+        assert len(keys) == len(set(keys))
+        for item in items:
+            x, y, width, height = item["rect"]
+            assert x >= 0 and y >= 0
+            assert width > 0 and height > 0
+            assert x + width <= 200
+            assert y + height <= 100
+
+
+def test_layout_items_do_not_overlap_on_the_same_visual_layer():
+    manifest = load_manifest()
+    for action in manifest["Actions"]:
+        layout_path = PLUGIN_ROOT / action["Encoder"]["layout"]
+        items = json.loads(layout_path.read_text(encoding="utf-8"))["items"]
+        for index, first in enumerate(items):
+            for second in items[index + 1 :]:
+                if first.get("zOrder", 0) == second.get("zOrder", 0):
+                    assert not rectangles_overlap(first["rect"], second["rect"]), (
+                        f'{first["key"]} overlaps {second["key"]} on zOrder '
+                        f'{first.get("zOrder", 0)}'
+                    )
 
 
 def test_atomic_json_creates_parent_and_replaces_file(tmp_path):
@@ -62,7 +160,7 @@ def test_atomic_json_creates_parent_and_replaces_file(tmp_path):
         ('"connected"', {}),
     ],
 )
-def test_status_accepts_only_valid_json_objects(tmp_path, monkeypatch, contents, expected):
+def test_status_reads_valid_json_and_ignores_invalid_json(tmp_path, monkeypatch, contents, expected):
     status_path = tmp_path / "status.json"
     status_path.write_text(contents)
     monkeypatch.setattr(plugin, "STATUS", status_path)
@@ -86,33 +184,32 @@ def test_status_returns_empty_when_file_is_missing(tmp_path, monkeypatch):
         ("hot", None),
         (float("nan"), None),
         (float("inf"), None),
-        ([], None),
+        ({"temperature": 145}, None),
     ],
 )
-def test_finite_number_rejects_bad_or_non_finite_values(value, expected):
-    assert plugin.finite_number(value) == expected
-
-
-@pytest.mark.parametrize("bad_target", [None, True, "hot", float("nan"), float("inf"), []])
-def test_target_f_falls_back_to_off_for_bad_values(monkeypatch, bad_target):
-    monkeypatch.setattr(plugin, "status", lambda: {"target_f": bad_target})
-
-    assert plugin.target_f() == 0.0
+def test_finite_number_rejects_malformed_and_non_finite_values(value, expected):
+    result = plugin.finite_number(value)
+    if expected is None:
+        assert result is None
+    else:
+        assert result == expected
 
 
 @pytest.mark.parametrize(
-    ("state", "now", "expected"),
-    [
-        ({"connected": False}, 1_000, False),
-        ({"connected": True, "updated_ts": 700}, 1_000, False),
-        ({"connected": True, "updated_ts": 699.9}, 1_000, True),
-        ({"connected": True, "updated_ts": 1_001}, 1_000, False),
-        ({"connected": True}, 1_000, True),
-        ({"connected": True, "updated_ts": "invalid"}, 1_000, True),
-    ],
+    ("state", "expected"),
+    [({"target_f": 145}, 145.0), ({"target_f": 130.5}, 130.5), ({}, 0.0)],
 )
-def test_status_staleness_uses_five_minute_threshold(state, now, expected):
-    assert plugin.status_is_stale(state, now=now) is expected
+def test_target_f(monkeypatch, state, expected):
+    monkeypatch.setattr(plugin, "status", lambda: state)
+
+    assert plugin.target_f() == expected
+
+
+@pytest.mark.parametrize("bad_target", [None, True, "hot", float("nan"), float("inf"), []])
+def test_target_f_falls_back_to_off_for_malformed_values(monkeypatch, bad_target):
+    monkeypatch.setattr(plugin, "status", lambda: {"target_f": bad_target})
+
+    assert plugin.target_f() == 0.0
 
 
 @pytest.mark.parametrize(
@@ -127,18 +224,306 @@ def test_set_temp_writes_celsius_command(monkeypatch, fahrenheit, expected_celsi
 
     path, command = atomic_json.call_args.args
     assert path == plugin.COMMAND
-    assert command == {"cmd": "set_temp", "temp_c": expected_celsius}
+    assert command["cmd"] == "set_temp"
+    assert command["temp_c"] == expected_celsius
 
 
-def test_send_temp_command_reports_write_failure(monkeypatch):
+def test_request_reconnect_opens_the_ember_app(tmp_path, monkeypatch):
+    ember_app = tmp_path / "Ember Mug.app"
+    ember_app.mkdir()
+    popen = Mock()
+    monkeypatch.setattr(plugin, "EMBER_APP", ember_app)
+    monkeypatch.setattr(plugin.subprocess, "Popen", popen)
+
+    plugin.request_reconnect()
+
+    popen.assert_called_once_with(["open", str(plugin.EMBER_APP)])
+
+
+def test_request_reconnect_reports_missing_app_before_launch(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin, "EMBER_APP", tmp_path / "Missing Ember Mug.app")
+    popen = Mock()
+    monkeypatch.setattr(plugin.subprocess, "Popen", popen)
+
+    with pytest.raises(FileNotFoundError, match="Ember app not found"):
+        plugin.request_reconnect()
+
+    popen.assert_not_called()
+
+
+def test_arg_reads_stream_deck_command_line_flag(monkeypatch):
+    monkeypatch.setattr(plugin.sys, "argv", ["plugin.py", "-port", "1234"])
+
+    assert plugin.arg("-port") == "1234"
+
+
+@pytest.mark.parametrize(
+    ("state", "now", "expected"),
+    [
+        ({"connected": False}, 1_000, False),
+        ({"connected": True, "updated_ts": 701}, 1_000, False),
+        ({"connected": True, "updated_ts": 700}, 1_000, False),
+        ({"connected": True, "updated_ts": 699.9}, 1_000, True),
+        ({"connected": True, "updated_ts": 1_001}, 1_000, False),
+        ({"connected": True}, 1_000, True),
+        ({"connected": True, "updated_ts": "invalid"}, 1_000, True),
+    ],
+)
+def test_status_staleness_uses_five_minute_threshold(state, now, expected):
+    assert plugin.status_is_stale(state, now=now) is expected
+
+
+@pytest.mark.parametrize(
+    ("state", "target", "expected"),
+    [
+        ({"current_f": 145}, 145, True),
+        ({"current_f": 144}, 145, True),
+        ({"current_f": 146}, 145, True),
+        ({"current_f": 143.9}, 145, False),
+        ({"current_f": 145}, 0, False),
+        ({}, 145, False),
+    ],
+)
+def test_is_at_target_uses_one_degree_range(state, target, expected):
+    assert plugin.is_at_target(state, target) is expected
+
+
+def test_off_display_hides_temperature_and_arrow():
+    display = plugin.temperature_display({"current_f": 116}, 0)
+
+    assert display["value"] == {"value": "OFF", "enabled": True}
+    assert display["current"]["enabled"] is False
+    assert display["trend"]["enabled"] is False
+    assert display["target"]["enabled"] is False
+
+
+def test_target_preview_shows_only_selected_temperature():
+    display = plugin.temperature_display({"current_f": 116}, 145, target_only=True)
+
+    assert display["value"] == {"value": "145°", "enabled": True}
+    assert display["current"]["enabled"] is False
+    assert display["trend"]["enabled"] is False
+
+
+@pytest.mark.parametrize("bad_current", [None, True, "warm", float("nan"), float("inf"), []])
+def test_temperature_display_ignores_malformed_current_temperature(bad_current):
+    display = plugin.temperature_display({"current_f": bad_current}, 145)
+
+    assert display["value"] == {"value": "145°", "enabled": True}
+    assert display["current"]["enabled"] is False
+    assert display["trend"]["enabled"] is False
+
+
+def test_heating_display_uses_red_up_arrow():
+    display = plugin.temperature_display({"current_f": 120}, 145)
+
+    assert display["current"]["value"] == "120°"
+    assert display["trend"] == {"value": "▲", "color": "#FF5A5F", "enabled": True}
+    assert display["target"]["value"] == "145°"
+
+
+def test_cooling_display_uses_blue_down_arrow():
+    display = plugin.temperature_display({"current_f": 145}, 135)
+
+    assert display["trend"] == {"value": "▼", "color": "#3B9CFF", "enabled": True}
+
+
+def test_at_target_checkmark_can_be_shown_then_removed():
+    with_check = plugin.temperature_display({"current_f": 145}, 145, show_check=True)
+    without_check = plugin.temperature_display({"current_f": 145}, 145, show_check=False)
+
+    assert with_check["value"]["value"] == "145°  ✓"
+    assert without_check["value"]["value"] == "145°"
+    assert with_check["trend"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("state", "target", "expected"),
+    [
+        ({"current_f": 145}, 145, "145°  ✓"),
+        ({"current_f": 130}, 145, "130°  145°"),
+        ({}, 145, "—  145°"),
+        ({"current_f": 116}, 0, "116°  OFF"),
+    ],
+)
+def test_temperature_value(state, target, expected):
+    assert plugin.temperature_value(state, target) == expected
+
+
+def test_feedback_builds_connected_heating_payload(monkeypatch):
     ws = FeedbackSocket()
-    monkeypatch.setattr(plugin, "set_temp", Mock(side_effect=PermissionError("read only")))
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": True,
+            "battery_percent": 91,
+            "charging": True,
+            "liquid_state_label": "Heating",
+            "current_f": 130,
+            "target_f": 145,
+            "updated_ts": plugin.time.time(),
+        },
+    )
 
-    assert plugin.send_temp_command(ws, "dial-1", 145) is False
-    assert ws.messages[-1]["payload"] == {"title": "COMMAND FAILED", "value": "TRY AGAIN"}
+    plugin.feedback(ws, "dial-1", override=145)
+
+    message = ws.messages[-1]
+    assert message["event"] == "setFeedback"
+    assert message["context"] == "dial-1"
+    assert message["payload"]["title"] == "HEATING · 91% ⚡"
+    assert message["payload"]["trend"]["value"] == "▲"
 
 
-def test_send_temp_command_reports_success(monkeypatch):
+def test_feedback_hides_transient_unknown_liquid_state(monkeypatch):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": True,
+            "battery_percent": 100,
+            "charging": True,
+            "liquid_state_label": "Unknown",
+            "current_f": 76,
+            "updated_ts": plugin.time.time(),
+        },
+    )
+
+    plugin.feedback(ws, "dial-1", override=120)
+
+    assert ws.messages[-1]["payload"]["title"] == "CONNECTED · 100% ⚡"
+
+
+@pytest.mark.parametrize(
+    ("current_f", "target_f", "expected_state"),
+    [(119, 145, "HEATING"), (145, 120, "COOLING"), (145, 145, "PERFECT")],
+)
+def test_feedback_replaces_transitional_no_control_state(
+    monkeypatch, current_f, target_f, expected_state
+):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": True,
+            "battery_percent": 100,
+            "liquid_state_label": "Warm (No Control)",
+            "current_f": current_f,
+            "updated_ts": plugin.time.time(),
+        },
+    )
+
+    plugin.feedback(ws, "dial-1", override=target_f)
+
+    assert ws.messages[-1]["payload"]["title"] == f"{expected_state} · 100%"
+
+
+def test_feedback_gives_off_mode_its_own_connected_title(monkeypatch):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": True,
+            "battery_percent": 80,
+            "liquid_state_label": "Warm (No Control)",
+            "current_f": 116,
+            "updated_ts": plugin.time.time(),
+        },
+    )
+
+    plugin.feedback(ws, "dial-1", override=0)
+
+    payload = ws.messages[-1]["payload"]
+    assert payload["title"] == "CONNECTED · 80%"
+    assert payload["value"]["value"] == "OFF"
+    assert payload["trend"]["enabled"] is False
+
+
+def test_feedback_builds_offline_payload(monkeypatch):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(plugin, "status", lambda: {"connected": False})
+
+    plugin.feedback(ws, "dial-1", override=145)
+
+    payload = ws.messages[-1]["payload"]
+    assert payload["title"] == "OFFLINE"
+    assert payload["value"]["value"] == "145°"
+
+
+@pytest.mark.parametrize("bad_battery", ["unknown", True, float("nan"), float("inf"), []])
+def test_feedback_ignores_malformed_battery_without_crashing(monkeypatch, bad_battery):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": True,
+            "battery_percent": bad_battery,
+            "current_f": 130,
+            "updated_ts": plugin.time.time(),
+        },
+    )
+
+    plugin.feedback(ws, "dial-1", override=145)
+
+    payload = ws.messages[-1]["payload"]
+    assert payload["title"] == "CONNECTED"
+    assert payload["current"]["value"] == "130°"
+
+
+@pytest.mark.parametrize("bad_connected", ["true", 1, [], {}])
+def test_feedback_requires_a_real_boolean_connection_flag(monkeypatch, bad_connected):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": bad_connected,
+            "battery_percent": 90,
+            "current_f": 130,
+        },
+    )
+
+    plugin.feedback(ws, "dial-1", override=145)
+
+    assert ws.messages[-1]["payload"]["title"] == "OFFLINE"
+
+
+def test_feedback_treats_old_connected_status_as_offline(monkeypatch):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": True,
+            "updated_ts": 699.0,
+            "battery_percent": 90,
+            "current_f": 130,
+        },
+    )
+
+    plugin.feedback(ws, "dial-1", override=145)
+
+    assert ws.messages[-1]["payload"]["title"] == "OFFLINE"
+
+
+def test_message_feedback_hides_comparison_fields():
+    ws = FeedbackSocket()
+
+    plugin.message_feedback(ws, "dial-1", "RECONNECTING…", "…")
+
+    payload = ws.messages[-1]["payload"]
+    assert payload["title"] == "RECONNECTING…"
+    assert payload["value"] == {"value": "…", "enabled": True}
+    assert payload["current"]["enabled"] is False
+    assert payload["trend"]["enabled"] is False
+
+
+def test_send_temp_command_returns_true_after_success(monkeypatch):
     ws = FeedbackSocket()
     set_temp = Mock()
     monkeypatch.setattr(plugin, "set_temp", set_temp)
@@ -148,107 +533,824 @@ def test_send_temp_command_reports_success(monkeypatch):
     assert ws.messages == []
 
 
-def test_request_reconnect_opens_existing_app(tmp_path, monkeypatch):
-    ember_app = tmp_path / "Ember Mug.app"
-    ember_app.mkdir()
-    popen = Mock()
-    monkeypatch.setattr(plugin, "EMBER_APP", ember_app)
-    monkeypatch.setattr(plugin.subprocess, "Popen", popen)
-
-    plugin.request_reconnect()
-
-    popen.assert_called_once_with(["open", str(ember_app)])
-
-
-def test_request_reconnect_reports_missing_app(tmp_path, monkeypatch):
-    popen = Mock()
-    monkeypatch.setattr(plugin, "EMBER_APP", tmp_path / "Missing.app")
-    monkeypatch.setattr(plugin.subprocess, "Popen", popen)
-
-    with pytest.raises(FileNotFoundError, match="Ember app not found"):
-        plugin.request_reconnect()
-
-    popen.assert_not_called()
-
-
-def test_feedback_treats_old_connected_status_as_offline(monkeypatch):
+@pytest.mark.parametrize("error", [PermissionError("denied"), OSError("disk full")])
+def test_send_temp_command_reports_filesystem_failure_without_crashing(monkeypatch, error):
     ws = FeedbackSocket()
-    monkeypatch.setattr(
-        plugin,
-        "status",
-        lambda: {
-            "connected": True,
-            "updated_ts": plugin.time.time() - plugin.STATUS_STALE_SECONDS - 1,
-            "battery_percent": 90,
-        },
+    monkeypatch.setattr(plugin, "set_temp", Mock(side_effect=error))
+
+    assert plugin.send_temp_command(ws, "dial-1", 145) is False
+    payload = ws.messages[-1]["payload"]
+    assert payload["title"] == "COMMAND FAILED"
+    assert payload["value"]["value"] == "TRY AGAIN"
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected"),
+    [(0, 0), (119, 120), (126, 130), (138, 140), (144, 145)],
+)
+def test_sync_selection_chooses_nearest_preset(monkeypatch, actual, expected):
+    monkeypatch.setattr(plugin, "target_f", lambda: actual)
+
+    plugin.sync_selection()
+
+    assert plugin.selected == expected
+
+
+def decode_client_frame(frame):
+    length_code = frame[1] & 0x7F
+    position = 2
+    if length_code == 126:
+        length = struct.unpack("!H", frame[position : position + 2])[0]
+        position += 2
+    elif length_code == 127:
+        length = struct.unpack("!Q", frame[position : position + 8])[0]
+        position += 8
+    else:
+        length = length_code
+    mask = frame[position : position + 4]
+    position += 4
+    encoded = frame[position : position + length]
+    return bytes(byte ^ mask[index % 4] for index, byte in enumerate(encoded))
+
+
+@pytest.mark.parametrize("text_size", [1, 200, 70_000])
+def test_websocket_send_encodes_masked_json_frames(monkeypatch, text_size):
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket()
+    monkeypatch.setattr(plugin.os, "urandom", lambda count: b"\x01" * count)
+    message = {"text": "x" * text_size}
+
+    websocket.send(message)
+
+    frame = websocket.sock.sent[-1]
+    assert frame[0] == 0x81
+    assert frame[1] & 0x80
+    assert json.loads(decode_client_frame(frame)) == message
+
+
+def server_frame(opcode, payload=b""):
+    return bytes([0x80 | opcode, len(payload)]) + payload
+
+
+def test_websocket_receive_decodes_text_message():
+    payload = json.dumps({"event": "dialRotate"}).encode()
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket([server_frame(1, payload)])
+
+    assert websocket.receive() == {"event": "dialRotate"}
+
+
+@pytest.mark.parametrize("payload_size", [200, 70_000])
+def test_websocket_receive_supports_extended_payload_lengths(payload_size):
+    payload = json.dumps({"text": "x" * payload_size}).encode()
+    if len(payload) < 65_536:
+        header = bytes([0x81, 126]) + struct.pack("!H", len(payload))
+    else:
+        header = bytes([0x81, 127]) + struct.pack("!Q", len(payload))
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket([header[:1], header[1:], payload[:7], payload[7:]])
+
+    assert websocket.receive() == {"text": "x" * payload_size}
+
+
+def test_websocket_receive_raises_when_socket_ends_without_a_frame():
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket()
+
+    with pytest.raises(EOFError):
+        websocket.receive()
+
+
+def test_websocket_receive_raises_when_socket_ends_mid_frame():
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket([b"\x81", b""])
+
+    with pytest.raises(EOFError):
+        websocket.receive()
+
+
+def test_websocket_receive_replies_to_ping():
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket([server_frame(9, b"hello")])
+    websocket.send_raw = Mock()
+
+    assert websocket.receive() is None
+    websocket.send_raw.assert_called_once_with(10, b"hello")
+
+
+def test_websocket_receive_raises_when_stream_deck_closes_connection():
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket([server_frame(8)])
+
+    with pytest.raises(EOFError):
+        websocket.receive()
+
+
+def test_websocket_send_raw_builds_masked_control_frame(monkeypatch):
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket()
+    monkeypatch.setattr(plugin.os, "urandom", lambda count: b"\x02" * count)
+
+    websocket.send_raw(10, b"hello")
+
+    frame = websocket.sock.sent[-1]
+    assert frame[0] == 0x8A
+    assert decode_client_frame(frame) == b"hello"
+
+
+def test_websocket_handshake_connects_and_sets_short_timeout(monkeypatch):
+    key_bytes = b"k" * 16
+    key = base64.b64encode(key_bytes).decode()
+    accept = base64.b64encode(
+        hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
     )
+    sock = FakeSocket([b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"])
+    create_connection = Mock(return_value=sock)
+    monkeypatch.setattr(plugin.socket, "create_connection", create_connection)
+    monkeypatch.setattr(plugin.os, "urandom", lambda count: key_bytes)
 
-    plugin.feedback(ws, "dial-1", override=145)
+    websocket = plugin.WebSocket(4321)
 
-    assert ws.messages[-1]["payload"]["title"] == "EMBER · OFFLINE"
-
-
-@pytest.mark.parametrize("bad_connected", ["true", 1, [], {}])
-def test_feedback_requires_real_boolean_connection(monkeypatch, bad_connected):
-    ws = FeedbackSocket()
-    monkeypatch.setattr(
-        plugin,
-        "status",
-        lambda: {"connected": bad_connected, "updated_ts": plugin.time.time(), "battery_percent": 90},
-    )
-
-    plugin.feedback(ws, "dial-1", override=145)
-
-    assert ws.messages[-1]["payload"]["title"] == "EMBER · OFFLINE"
+    assert websocket.sock is sock
+    create_connection.assert_called_once_with(("127.0.0.1", 4321), timeout=5)
+    assert sock.timeout == 0.25
+    assert b"GET / HTTP/1.1" in sock.sent[0]
 
 
-@pytest.mark.parametrize("bad_battery", ["unknown", True, float("nan"), float("inf"), []])
-def test_feedback_ignores_bad_battery_without_crashing(monkeypatch, bad_battery):
-    ws = FeedbackSocket()
-    monkeypatch.setattr(
-        plugin,
-        "status",
-        lambda: {
-            "connected": True,
-            "updated_ts": plugin.time.time(),
-            "battery_percent": bad_battery,
-        },
-    )
+def test_websocket_handshake_rejects_invalid_response(monkeypatch):
+    sock = FakeSocket([b"HTTP/1.1 403 Forbidden\r\n\r\n"])
+    monkeypatch.setattr(plugin.socket, "create_connection", lambda *args, **kwargs: sock)
 
-    plugin.feedback(ws, "dial-1", override=145)
-
-    assert ws.messages[-1]["payload"]["title"] == "EMBER"
+    with pytest.raises(RuntimeError, match="handshake failed"):
+        plugin.WebSocket(4321)
 
 
-def make_websocket(chunks):
-    websocket = object.__new__(plugin.WebSocket)
-    websocket.sock = FakeSocket(chunks)
+class ScriptedWebSocket(FeedbackSocket):
+    def __init__(self, events, clock=None, press_times=()):
+        super().__init__()
+        self.events = iter(events)
+        self.clock = clock
+        self.press_times = iter(press_times)
+
+    def receive(self):
+        try:
+            event = next(self.events)
+        except StopIteration:
+            raise EOFError
+        if self.clock is not None and event.get("event") in ("dialDown", "dialUp"):
+            self.clock.value = next(self.press_times, self.clock.value)
+        return event
+
+
+class Clock:
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
+class TimedWebSocket(FeedbackSocket):
+    def __init__(self, wall_clock, steady_clock, timeline):
+        super().__init__()
+        self.wall_clock = wall_clock
+        self.steady_clock = steady_clock
+        self.timeline = iter(timeline)
+
+    def receive(self):
+        try:
+            item = next(self.timeline)
+        except StopIteration:
+            raise EOFError
+        if len(item) == 2:
+            wall_time, result = item
+            steady_time = wall_time
+        else:
+            wall_time, steady_time, result = item
+        self.wall_clock.value = wall_time
+        self.steady_clock.value = steady_time
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def run_main_until_events_end(monkeypatch, events, monotonic_values=()):
+    steady_clock = Clock(1.0)
+    websocket = ScriptedWebSocket(events, steady_clock, monotonic_values)
+    monkeypatch.setattr(plugin, "WebSocket", lambda port: websocket)
+    arguments = {"-port": "1234", "-pluginUUID": "plugin-id", "-registerEvent": "registerPlugin"}
+    monkeypatch.setattr(plugin, "arg", arguments.__getitem__)
+    monkeypatch.setattr(plugin.time, "time", lambda: 1.0)
+    monkeypatch.setattr(plugin.time, "monotonic", steady_clock)
+    with pytest.raises(EOFError):
+        plugin.main()
     return websocket
 
 
-def test_websocket_reads_header_split_across_tcp_chunks():
-    websocket = make_websocket([b"\x81", b"\x02", b"{}"])
-
-    assert websocket.receive() == {}
-
-
-def test_websocket_reads_extended_payload_length():
-    payload = json.dumps({"message": "x" * 200}).encode()
-    frame = b"\x81\x7e" + struct.pack("!H", len(payload)) + payload
-    websocket = make_websocket([frame[:1], frame[1:3], frame[3:25], frame[25:]])
-
-    assert websocket.receive() == {"message": "x" * 200}
-
-
-def test_websocket_raises_eof_when_frame_ends_early():
-    websocket = make_websocket([b"\x81\x05", b"ab", b""])
-
+def run_timed_main(monkeypatch, timeline, clock=None):
+    wall_clock = clock or Clock()
+    steady_clock = Clock()
+    websocket = TimedWebSocket(wall_clock, steady_clock, timeline)
+    monkeypatch.setattr(plugin, "WebSocket", lambda port: websocket)
+    arguments = {"-port": "1234", "-pluginUUID": "plugin-id", "-registerEvent": "registerPlugin"}
+    monkeypatch.setattr(plugin, "arg", arguments.__getitem__)
+    monkeypatch.setattr(plugin.time, "time", wall_clock)
+    monkeypatch.setattr(plugin.time, "monotonic", steady_clock)
     with pytest.raises(EOFError):
-        websocket.receive()
+        plugin.main()
+    return websocket
 
 
-def test_websocket_raises_eof_when_header_is_missing():
-    websocket = make_websocket([b""])
+def test_target_preview_expires_then_checkmark_disappears_after_three_seconds(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
 
-    with pytest.raises(EOFError):
-        websocket.receive()
+    run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (2.6, plugin.socket.timeout()),
+            (5.7, plugin.socket.timeout()),
+        ],
+    )
+
+    assert any(call.kwargs.get("target_only") is True for call in feedback.call_args_list)
+    assert any(call.kwargs.get("show_check") is True for call in feedback.call_args_list)
+    assert feedback.call_args.kwargs.get("show_check", False) is False
+
+
+def test_checkmark_does_not_repeat_while_mug_stays_at_target(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+
+    run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (2.1, plugin.socket.timeout()),
+            (4.2, plugin.socket.timeout()),
+        ],
+    )
+
+    assert not any(call.kwargs.get("show_check") is True for call in feedback.call_args_list)
+
+
+def test_checkmark_reappears_after_leaving_and_reentering_target_range(monkeypatch):
+    clock = Clock()
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145 if clock.value in (0.0, 4.2) else 140})
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+
+    run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (2.1, plugin.socket.timeout()),
+            (4.2, plugin.socket.timeout()),
+        ],
+        clock=clock,
+    )
+
+    assert any(call.kwargs.get("show_check") is True for call in feedback.call_args_list)
+
+
+def test_target_preview_expiry_updates_every_visible_dial_context(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 130})
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+
+    run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (0.1, {"event": "willAppear", "context": "dial-2"}),
+            (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (2.6, plugin.socket.timeout()),
+        ],
+    )
+
+    refreshed_contexts = {
+        call.args[1]
+        for call in feedback.call_args_list
+        if call.kwargs.get("show_check") is False
+    }
+    assert refreshed_contexts == {"dial-1", "dial-2"}
+
+
+def test_reconnect_rejects_connected_status_older_than_request(monkeypatch):
+    clock = Clock()
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {"connected": True, "updated_ts": 0.5, "current_f": 145, "target_f": 145},
+    )
+    monkeypatch.setattr(plugin, "feedback", Mock())
+    monkeypatch.setattr(plugin, "request_reconnect", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, 0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, 10.0, {"event": "dialDown", "context": "dial-1"}),
+            (1.0, 12.0, {"event": "dialUp", "context": "dial-1"}),
+            (3.1, 14.1, plugin.socket.timeout()),
+        ],
+        clock=clock,
+    )
+
+    reconnect_titles = [
+        message["payload"]["title"]
+        for message in websocket.messages
+        if message.get("event") == "setFeedback"
+    ]
+    assert reconnect_titles.count("RECONNECTING…") >= 2
+    assert "CONNECTED" not in reconnect_titles
+
+
+# A junk "connected" value in status.json must not end the reconnect wait.
+# Only a real True counts, the same rule the normal display uses.
+@pytest.mark.parametrize("bad_connected", ["false", "yes", 1])
+def test_reconnect_ignores_fresh_status_without_a_real_connection_flag(monkeypatch, bad_connected):
+    clock = Clock()
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": bad_connected,
+            "updated_ts": clock.value,
+            "current_f": 145,
+            "target_f": 145,
+        },
+    )
+    monkeypatch.setattr(plugin, "feedback", Mock())
+    monkeypatch.setattr(plugin, "request_reconnect", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, 0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, 10.0, {"event": "dialDown", "context": "dial-1"}),
+            (1.0, 12.0, {"event": "dialUp", "context": "dial-1"}),
+            (3.1, 14.1, plugin.socket.timeout()),
+        ],
+        clock=clock,
+    )
+
+    titles = [
+        message["payload"]["title"]
+        for message in websocket.messages
+        if message.get("event") == "setFeedback"
+    ]
+    assert "CONNECTED" not in titles
+    assert titles.count("RECONNECTING…") >= 2
+
+
+def test_reconnect_accepts_fresh_connected_status(monkeypatch):
+    clock = Clock()
+    plugin.selected = 145
+    sync_selection = Mock()
+    monkeypatch.setattr(plugin, "sync_selection", sync_selection)
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {
+            "connected": clock.value >= 3.1,
+            "updated_ts": clock.value,
+            "current_f": 145,
+            "target_f": 145,
+        },
+    )
+    monkeypatch.setattr(plugin, "feedback", Mock())
+    monkeypatch.setattr(plugin, "request_reconnect", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, 0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, 10.0, {"event": "dialDown", "context": "dial-1"}),
+            (1.0, 12.0, {"event": "dialUp", "context": "dial-1"}),
+            (3.1, 14.1, plugin.socket.timeout()),
+        ],
+        clock=clock,
+    )
+
+    assert any(
+        message.get("payload", {}).get("title") == "CONNECTED"
+        for message in websocket.messages
+    )
+    assert sync_selection.call_count >= 2
+
+
+def test_reconnect_message_stops_after_thirty_second_timeout(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {"connected": False, "updated_ts": 0, "current_f": 145, "target_f": 145},
+    )
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+    monkeypatch.setattr(plugin, "request_reconnect", Mock())
+
+    run_timed_main(
+        monkeypatch,
+        [
+            (0.0, 0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, 10.0, {"event": "dialDown", "context": "dial-1"}),
+            (1.0, 12.0, {"event": "dialUp", "context": "dial-1"}),
+            (31.1, 42.1, plugin.socket.timeout()),
+        ],
+    )
+
+    assert feedback.call_args.args[1] == "dial-1"
+
+
+def test_wall_clock_jump_forward_does_not_end_target_preview_early(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 130})
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+
+    run_timed_main(
+        monkeypatch,
+        [
+            (1_000.0, 0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1_001.0, 1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (10_000.0, 1.2, plugin.socket.timeout()),
+            (10_001.0, 2.6, plugin.socket.timeout()),
+        ],
+    )
+
+    target_only_calls = [call for call in feedback.call_args_list if call.kwargs.get("target_only") is True]
+    comparison_calls = [call for call in feedback.call_args_list if call.kwargs.get("show_check") is False]
+    assert len(target_only_calls) == 1
+    assert len(comparison_calls) == 1
+
+
+def test_wall_clock_jump_backward_does_not_extend_checkmark(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+
+    run_timed_main(
+        monkeypatch,
+        [
+            (1_000.0, 0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1_001.0, 1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (900.0, 2.6, plugin.socket.timeout()),
+            (800.0, 5.7, plugin.socket.timeout()),
+        ],
+    )
+
+    assert any(call.kwargs.get("show_check") is True for call in feedback.call_args_list)
+    assert feedback.call_args.kwargs.get("show_check", False) is False
+
+
+def test_reconnect_timeout_uses_steady_clock_when_wall_clock_moves_backward(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(
+        plugin,
+        "status",
+        lambda: {"connected": False, "updated_ts": 0, "current_f": 145, "target_f": 145},
+    )
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+    monkeypatch.setattr(plugin, "request_reconnect", Mock())
+
+    run_timed_main(
+        monkeypatch,
+        [
+            (1_000.0, 0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1_001.0, 10.0, {"event": "dialDown", "context": "dial-1"}),
+            (1_001.0, 12.0, {"event": "dialUp", "context": "dial-1"}),
+            (900.0, 42.1, plugin.socket.timeout()),
+        ],
+    )
+
+    assert feedback.call_args.args[1] == "dial-1"
+
+
+def test_large_sleep_wake_jump_expires_preview_and_check_without_crashing(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+
+    run_timed_main(
+        monkeypatch,
+        [
+            (1_000.0, 0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1_001.0, 1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (4_601.0, 3_601.0, plugin.socket.timeout()),
+            (4_605.0, 3_605.0, plugin.socket.timeout()),
+        ],
+    )
+
+    assert any(call.kwargs.get("show_check") is True for call in feedback.call_args_list)
+    assert feedback.call_args.kwargs.get("show_check", False) is False
+
+
+def test_main_rotates_clockwise_from_off_to_120(monkeypatch):
+    plugin.selected = 0
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 100})
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}},
+        ],
+    )
+
+    assert plugin.selected == 120
+    set_temp.assert_called_once_with(120)
+
+
+def test_main_rotates_counterclockwise_from_off_to_145(monkeypatch):
+    plugin.selected = 0
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 100})
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": -1}},
+        ],
+    )
+
+    assert plugin.selected == 145
+    set_temp.assert_called_once_with(145)
+
+
+@pytest.mark.parametrize(("starting", "ticks", "expected"), [(130, 999, 145), (140, -999, 120)])
+def test_main_clamps_extreme_dial_rotation_to_valid_presets(monkeypatch, starting, ticks, expected):
+    plugin.selected = starting
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 100})
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": ticks}},
+        ],
+    )
+
+    assert plugin.selected == expected
+    set_temp.assert_called_once_with(expected)
+
+
+def test_main_ignores_dial_event_with_zero_ticks(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 100})
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 0}},
+        ],
+    )
+
+    assert plugin.selected == 140
+    set_temp.assert_not_called()
+
+
+def test_main_short_press_turns_heating_off(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        monotonic_values=[10.0, 10.5],
+    )
+
+    assert plugin.selected == 0
+    set_temp.assert_called_once_with(0)
+
+
+def test_main_press_just_below_hold_threshold_is_still_a_short_press(monkeypatch):
+    plugin.selected = 0
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 100})
+    set_temp = Mock()
+    reconnect = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        monotonic_values=[10.0, 10.0 + plugin.HOLD_SECONDS - 0.001],
+    )
+
+    set_temp.assert_called_once_with(145)
+    reconnect.assert_not_called()
+
+
+def test_main_press_at_hold_threshold_reconnects(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    reconnect = Mock()
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        monotonic_values=[10.0, 10.0 + plugin.HOLD_SECONDS],
+    )
+
+    reconnect.assert_called_once_with()
+    set_temp.assert_not_called()
+
+
+def test_main_tracks_press_duration_separately_for_each_dial(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    reconnect = Mock()
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "willAppear", "context": "dial-2"},
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialDown", "context": "dial-2"},
+            {"event": "dialUp", "context": "dial-1"},
+            {"event": "dialUp", "context": "dial-2"},
+        ],
+        monotonic_values=[10.0, 10.2, 10.5, 12.0],
+    )
+
+    set_temp.assert_called_once_with(0)
+    reconnect.assert_called_once_with()
+
+
+def test_main_ignores_dial_up_after_action_disappears(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    set_temp = Mock()
+    reconnect = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "willDisappear", "context": "dial-1"},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        monotonic_values=[10.0],
+    )
+
+    set_temp.assert_not_called()
+    reconnect.assert_not_called()
+
+
+def test_main_long_press_requests_reconnect_without_changing_temperature(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    monkeypatch.setattr(plugin, "feedback", Mock())
+    reconnect = Mock()
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+
+    websocket = run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        monotonic_values=[10.0, 12.0],
+    )
+
+    reconnect.assert_called_once_with()
+    set_temp.assert_not_called()
+    assert any(message.get("payload", {}).get("title") == "RECONNECTING…" for message in websocket.messages)
+
+
+def test_main_keeps_previous_selection_when_command_file_write_fails(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 130})
+    monkeypatch.setattr(plugin, "set_temp", Mock(side_effect=PermissionError("denied")))
+    monkeypatch.setattr(plugin, "feedback", Mock())
+
+    websocket = run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}},
+        ],
+    )
+
+    assert plugin.selected == 140
+    assert any(
+        message.get("payload", {}).get("title") == "COMMAND FAILED"
+        for message in websocket.messages
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_title"),
+    [
+        (FileNotFoundError("missing"), "APP NOT FOUND"),
+        (OSError("launch failed"), "RECONNECT FAILED"),
+    ],
+)
+def test_main_reports_reconnect_launch_failure_without_crashing(monkeypatch, error, expected_title):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: {"current_f": 145})
+    monkeypatch.setattr(plugin, "feedback", Mock())
+    monkeypatch.setattr(plugin, "request_reconnect", Mock(side_effect=error))
+
+    websocket = run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "context": "dial-1"},
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        monotonic_values=[10.0, 12.0],
+    )
+
+    assert any(
+        message.get("payload", {}).get("title") == expected_title
+        for message in websocket.messages
+    )

@@ -13,8 +13,33 @@
       "key": "value",
       "type": "text",
       "rect": [12, 36, 176, 50],
+      "zOrder": 1,
       "font": { "size": 30, "weight": 700 },
       "alignment": "center"
+    },
+    {
+      "key": "current",
+      "type": "text",
+      "rect": [8, 39, 72, 42],
+      "zOrder": 2,
+      "font": { "size": 27, "weight": 700 },
+      "alignment": "right"
+    },
+    {
+      "key": "trend",
+      "type": "text",
+      "rect": [80, 43, 40, 34],
+      "zOrder": 2,
+      "font": { "size": 18, "weight": 700 },
+      "alignment": "center"
+    },
+    {
+      "key": "target",
+      "type": "text",
+      "rect": [120, 39, 72, 42],
+      "zOrder": 2,
+      "font": { "size": 27, "weight": 700 },
+      "alignment": "left"
     }
   ]
 }

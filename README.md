@@ -7,6 +7,7 @@ My favorite temperature is **145°F**, so I wanted the dial to feel natural:
 - turn it to move between **120°F, 130°F, 140°F, and 145°F**;
 - press it to turn heating off;
 - press it again to turn heating back on at **145°F**;
+- hold it to reconnect the mug;
 - show the mug's battery percentage and charging status on the Stream Deck screen.
 
 It sounded like a macro. It turned into a small lesson in Python, Bluetooth, background apps, virtual environments, and how Stream Deck plugins actually work.
@@ -160,14 +161,16 @@ heating on → off
 heating off → 145°F
 ```
 
-The display is intentionally simple:
+The display shows where the drink is now and where it is going:
 
 ```text
-EMBER · 78% ⚡
-      145°F
+HEATING · 78% ⚡
+  120°  ▲  145°
 ```
 
-The lightning bolt appears while the mug is charging. I originally had a mug icon on the display, but I did not like how it looked, so I replaced the built-in icon layout with a clean text-only layout.
+The up arrow is red while the mug is heating, and the down arrow is blue while it is cooling. While I turn the dial, the screen briefly shows only the target I am choosing. At the target, a check mark appears for three seconds and then leaves the clean temperature number. When heating is off, the screen simply says **OFF** without an arrow. The lightning bolt appears while the mug is charging.
+
+Holding the dial for 1.5 seconds asks the Ember menu-bar app to reconnect. The screen shows **RECONNECTING**, then briefly confirms **CONNECTED** when fresh mug data arrives.
 
 ## Project files
 
@@ -234,4 +237,4 @@ This is an unofficial personal project. It is not affiliated with or endorsed by
 
 I wanted to control my Ember Mug with a Stream Deck dial. The first Python library could change the temperature, but reconnecting to the mug for every command was unreliable. I used a macOS menu-bar app to keep the Bluetooth connection running, then built this Stream Deck plugin to send commands to that app.
 
-Turning the dial moves between **120°F, 130°F, 140°F, and 145°F**. Pressing it turns heating off, and pressing it again turns heating back on at my default of **145°F**. The Stream Deck screen also shows the mug's battery percentage and whether it is charging.
+Turning the dial moves between **120°F, 130°F, 140°F, and 145°F**. Pressing it turns heating off, and pressing it again turns heating back on at my default of **145°F**. Holding it reconnects the mug. The Stream Deck screen also shows the current and target temperatures, heating or cooling direction, battery percentage, and whether the mug is charging.
