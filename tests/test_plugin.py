@@ -489,6 +489,76 @@ def test_feedback_builds_offline_payload(monkeypatch):
     assert payload["value"]["value"] == "145°"
 
 
+# Offline with heating off used to say OFFLINE over OFF. That pair is the one
+# case that shows the sleeping mug, with every text field switched off.
+@pytest.mark.parametrize(
+    "state",
+    [
+        {},
+        {"connected": False, "battery_percent": 90, "current_f": 130},
+        {"connected": True, "updated_ts": 699.0, "battery_percent": 90},
+    ],
+)
+def test_feedback_shows_sleeping_mug_when_offline_and_heating_is_off(monkeypatch, state):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(plugin, "status", lambda: state)
+
+    plugin.feedback(ws, "dial-1", override=0)
+
+    payload = ws.messages[-1]["payload"]
+    assert payload["mug"] == {"value": plugin.SLEEPING_MUG, "enabled": True}
+    assert payload["title"] == ""
+    assert all(payload[key]["enabled"] is False for key in ("value", "current", "trend", "target"))
+
+
+# Only one "off" is not enough for the mug: a connected mug with heating off
+# keeps its battery line, and an offline mug with a target keeps its number.
+@pytest.mark.parametrize(
+    ("state", "target", "expected_title"),
+    [
+        ({"connected": True, "updated_ts": 1_000.0, "battery_percent": 78}, 0, "CONNECTED · 78%"),
+        ({"connected": False}, 145, "OFFLINE"),
+    ],
+)
+def test_feedback_keeps_text_when_only_one_thing_is_off(monkeypatch, state, target, expected_title):
+    ws = FeedbackSocket()
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(plugin, "status", lambda: state)
+
+    plugin.feedback(ws, "dial-1", override=target)
+
+    payload = ws.messages[-1]["payload"]
+    assert payload["title"] == expected_title
+    assert payload["value"]["enabled"] is True
+    assert payload["mug"] == {"enabled": False}
+
+
+# The picture sits on top of the text, so every text screen has to switch it
+# off again or the mug would stay stuck over the temperatures.
+def test_text_screens_switch_the_sleeping_mug_off():
+    ws = FeedbackSocket()
+
+    plugin.message_feedback(ws, "dial-1", "RECONNECTING…", "…")
+
+    assert ws.messages[-1]["payload"]["mug"] == {"enabled": False}
+    assert plugin.temperature_display({"current_f": 120}, 145)["mug"] == {"enabled": False}
+    assert plugin.temperature_display({}, 0)["mug"] == {"enabled": False}
+
+
+# The deck is pure black, so the picture's background has to be #000000 or it
+# shows up as a gray box. It also has to fill the layout slot made for it.
+def test_sleeping_mug_picture_fills_its_slot_on_pure_black():
+    picture = (PLUGIN_ROOT / plugin.SLEEPING_MUG).read_text(encoding="utf-8")
+    layout = json.loads((PLUGIN_ROOT / "layouts" / "temperature.json").read_text(encoding="utf-8"))
+    slot = next(item for item in layout["items"] if item["key"] == "mug")
+
+    assert '<rect width="200" height="100" fill="#000000"/>' in picture
+    assert slot["type"] == "pixmap"
+    assert slot["rect"] == [0, 0, 200, 100]
+    assert slot["enabled"] is False
+
+
 @pytest.mark.parametrize("bad_battery", ["unknown", True, float("nan"), float("inf"), []])
 def test_feedback_ignores_malformed_battery_without_crashing(monkeypatch, bad_battery):
     ws = FeedbackSocket()

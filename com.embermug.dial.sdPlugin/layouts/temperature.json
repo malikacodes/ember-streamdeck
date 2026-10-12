@@ -40,6 +40,13 @@
       "zOrder": 2,
       "font": { "size": 27, "weight": 700 },
       "alignment": "left"
+    },
+    {
+      "key": "mug",
+      "type": "pixmap",
+      "rect": [0, 0, 200, 100],
+      "zOrder": 3,
+      "enabled": false
     }
   ]
 }

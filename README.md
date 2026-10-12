@@ -170,6 +170,8 @@ HEATING · 78% ⚡
 
 The up arrow is red while the mug is heating, and the down arrow is blue while it is cooling. While I turn the dial, the screen briefly shows only the target I am choosing. At the target, a check mark appears for three seconds and then leaves the clean temperature number. When heating is off, the screen simply says **OFF** without an arrow. The lightning bolt appears while the mug is charging.
 
+If the mug is offline and heating is off, the screen used to say **OFFLINE** over **OFF**. Now it shows one sleeping mug instead. If only one of those is true, the text stays, because the battery or the target is still worth reading.
+
 Holding the dial for 1.5 seconds asks the Ember menu-bar app to reconnect. The screen shows **RECONNECTING**, then briefly confirms **CONNECTED** when fresh mug data arrives.
 
 ## Project files
@@ -182,14 +184,16 @@ com.embermug.dial.sdPlugin/
 │   └── temperature.json
 └── imgs/
     ├── ember.svg
+    ├── sleeping-mug.svg
     ├── category-icon.png / category-icon@2x.png
     └── plugin-icon.png / plugin-icon@2x.png
 ```
 
 - `manifest.json` tells Stream Deck the plugin's name, ID, supported controls, entry point, and display layout.
 - `plugin.py` listens for dial events, reads mug status, writes commands, and updates the display.
-- `layouts/temperature.json` defines the text-only touch-screen layout.
+- `layouts/temperature.json` defines the touch-screen layout: the text fields, plus one picture slot for the sleeping mug.
 - `imgs/ember.svg` is used for the action artwork, not on the physical dial display.
+- `imgs/sleeping-mug.svg` is the picture the dial shows when the mug is offline and heating is off.
 - `imgs/category-icon.png` and `imgs/category-icon@2x.png` identify the Ember Mug group in Stream Deck's action list.
 - `imgs/plugin-icon.png` and `imgs/plugin-icon@2x.png` are the two plugin-icon sizes required by Stream Deck.
 

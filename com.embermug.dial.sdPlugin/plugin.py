@@ -21,6 +21,7 @@ STATUS_STALE_SECONDS = 300
 SUPPORT = Path.home() / "Library/Application Support/EmberMug"
 STATUS = SUPPORT / "status.json" # Mug data read from the Ember menu-bar app
 COMMAND = SUPPORT / "command.json" # Commands to control the Ember menu-bar app
+SLEEPING_MUG = "imgs/sleeping-mug.svg" # Shown when the mug is offline and heating is off
 EMBER_APP = Path.home() / "Applications/Ember Mug.app"
 selected = None # Current dial preset; none until the plugin initializes
 last_action = 0.0  # Time of the most recent dial action
@@ -178,6 +179,7 @@ def temperature_display(state, target, target_only=False, show_check=False):
         "current": {"value": "", "enabled": False},
         "trend": {"value": "", "enabled": False},
         "target": {"value": "", "enabled": False},
+        "mug": {"enabled": False},
     }
 
     # Heating off has its own uncluttered interface. OFF is a mode, not a
@@ -221,6 +223,20 @@ def temperature_value(state, target):
     return f"{current_text}  {target_text}"
 
 
+def sleeping_mug_display():
+    """Swap every text field for the sleeping mug picture."""
+    # The layout stacks the picture on top of the text. Each text field is
+    # switched off here so nothing from the last screen shows through.
+    return {
+        "title": "",
+        "value": {"value": "", "enabled": False},
+        "current": {"value": "", "enabled": False},
+        "trend": {"value": "", "enabled": False},
+        "target": {"value": "", "enabled": False},
+        "mug": {"value": SLEEPING_MUG, "enabled": True},
+    }
+
+
 def feedback(ws, context, override=None, target_only=False, show_check=False):
     state = status()
     connected = state.get("connected") is True and not status_is_stale(state)
@@ -251,6 +267,11 @@ def feedback(ws, context, override=None, target_only=False, show_check=False):
         title_state = "CONNECTED" if target < 1 else mug_state
         title = f"{title_state} · {round(float(battery))}%{charging}"
         display = temperature_display(state, target, target_only, show_check)
+    elif not connected and target < 1:
+        # OFFLINE on top and OFF underneath says "off" twice. When both are
+        # true the dial shows one sleeping mug instead of two words.
+        ws.send({"event": "setFeedback", "context": context, "payload": sleeping_mug_display()})
+        return
     else:
         title = "CONNECTED" if connected else "OFFLINE"
         display = temperature_display(state, target) if connected else temperature_display({}, target)
@@ -263,6 +284,7 @@ def message_feedback(ws, context, title, value):
         "current": {"value": "", "enabled": False},
         "trend": {"value": "", "enabled": False},
         "target": {"value": "", "enabled": False},
+        "mug": {"enabled": False},
     }
     ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, **display}})
 
