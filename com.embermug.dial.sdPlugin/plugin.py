@@ -306,6 +306,20 @@ def message_feedback(ws, context, title, value):
     ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, **display}})
 
 
+def redraw_all(ws, contexts, *args, message=None, **kwargs):
+    """Draw the same screen on every dial on screen.
+
+    With message=(title, value) it draws that short text screen; otherwise it
+    passes everything on to feedback().
+    """
+    # list() because a willDisappear could change the set while we loop.
+    for context in list(contexts):
+        if message:
+            message_feedback(ws, context, *message)
+        else:
+            feedback(ws, context, *args, **kwargs)
+
+
 def send_temp_command(ws, context, fahrenheit):
     """Write a mug command without allowing a filesystem error to kill the plugin."""
     try:
@@ -434,8 +448,7 @@ def main():
             # permanent part of the temperature display.
             checkmark_until = 0.0
             current_status = status()
-            for context in list(contexts):
-                feedback(ws, context, selected, state=current_status)
+            redraw_all(ws, contexts, selected, state=current_status)
             last_update = now
             continue
         if target_preview_until and now >= target_preview_until:
@@ -447,8 +460,7 @@ def main():
             if at_target and not was_at_target:
                 checkmark_until = now + CHECKMARK_SECONDS
             was_at_target = at_target
-            for context in list(contexts):
-                feedback(ws, context, selected, show_check=now < checkmark_until, state=current_status)
+            redraw_all(ws, contexts, selected, show_check=now < checkmark_until, state=current_status)
             last_update = now
             continue
         if now - last_update >= STATUS_REFRESH_SECONDS:
@@ -480,19 +492,16 @@ def main():
                     reconnect_requested_at = None
                     reconnect_started_at = None
                 else:
-                    for context in list(contexts):
-                        message_feedback(ws, context, "RECONNECTING…", "…")
+                    redraw_all(ws, contexts, message=("RECONNECTING…", "…"))
                     last_update = now
                     continue
             if now < connected_message_until:
                 value = temperature_value(current_status, selected or 0)
-                for context in list(contexts):
-                    message_feedback(ws, context, "CONNECTED", value)
+                redraw_all(ws, contexts, message=("CONNECTED", value))
                 last_update = now
                 continue
             if now < not_applied_until:
-                for context in list(contexts):
-                    message_feedback(ws, context, "NOT APPLIED", "TRY AGAIN")
+                redraw_all(ws, contexts, message=("NOT APPLIED", "TRY AGAIN"))
                 last_update = now
                 continue
             if now - last_action > SELECTION_SETTLE_SECONDS:
@@ -503,8 +512,7 @@ def main():
                     # before the dial falls back to what the mug is doing.
                     if selected != pending_selection:
                         not_applied_until = now + NOT_APPLIED_MESSAGE_SECONDS
-                        for context in list(contexts):
-                            message_feedback(ws, context, "NOT APPLIED", "TRY AGAIN")
+                        redraw_all(ws, contexts, message=("NOT APPLIED", "TRY AGAIN"))
                         pending_selection = None
                         last_update = now
                         continue
@@ -515,8 +523,7 @@ def main():
             elif not at_target:
                 checkmark_until = 0.0
             was_at_target = at_target
-            for context in list(contexts):
-                feedback(ws, context, selected, show_check=now < checkmark_until, state=current_status)
+            redraw_all(ws, contexts, selected, show_check=now < checkmark_until, state=current_status)
             last_update = now
 
 

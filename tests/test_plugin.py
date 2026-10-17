@@ -1818,3 +1818,23 @@ def test_every_screen_builds_the_same_five_fields_exactly():
         "target": off,
         "mug": {"value": plugin.SLEEPING_MUG, "enabled": True},
     }
+
+
+def test_short_messages_reach_every_dial_on_screen(monkeypatch):
+    # Protects the loops that draw one message on all dials: with two dials
+    # showing, NOT APPLIED has to land on both, not just the one I turned.
+    app_that_applies_after(monkeypatch, None)
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (0.0, {"event": "willAppear", "context": "dial-2"}),
+            (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (2.6, plugin.socket.timeout()),
+            (4.7, plugin.socket.timeout()),
+        ],
+    )
+
+    warned = [m["context"] for m in websocket.messages if m.get("payload", {}).get("title") == "NOT APPLIED"]
+    assert sorted(warned) == ["dial-1", "dial-2"]
