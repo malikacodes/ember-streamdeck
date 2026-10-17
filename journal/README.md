@@ -13,3 +13,4 @@ This is the part where I keep the real story of building this project. Not just 
 | 07 | October 17, 2026 | [The plugin gets a diary](07-the-plugin-gets-a-diary.md) |
 | 08 | October 17, 2026 | [Two seconds of nothing](08-two-seconds-of-nothing.md) |
 | 09 | October 17, 2026 | [The dial that changes its mind](09-the-dial-that-changes-its-mind.md) |
+| 10 | October 17, 2026 | [Saying things once](10-saying-things-once.md) |
