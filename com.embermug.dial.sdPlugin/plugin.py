@@ -190,19 +190,25 @@ def is_at_target(state, target):
     return current is not None and target is not None and target >= 1 and abs(current - target) <= 1
 
 
+def hidden_fields():
+    """Every field of the dial layout switched off; screens turn on what they need."""
+    return {
+        "value": {"value": "", "enabled": False},
+        "current": {"value": "", "enabled": False},
+        "trend": {"value": "", "enabled": False},
+        "target": {"value": "", "enabled": False},
+        "mug": {"enabled": False},
+    }
+
+
 def temperature_display(state, target, target_only=False, show_check=False):
     """Build the separate display fields used on the Stream Deck dial."""
     current = finite_number(state.get("current_f"))
     target = finite_number(target)
     target = target if target is not None else 0.0
     target_text = "OFF" if target < 1 else f"{round(target):d}°"
-    fields = {
-        "value": {"value": target_text, "enabled": True},
-        "current": {"value": "", "enabled": False},
-        "trend": {"value": "", "enabled": False},
-        "target": {"value": "", "enabled": False},
-        "mug": {"enabled": False},
-    }
+    fields = hidden_fields()
+    fields["value"] = {"value": target_text, "enabled": True}
 
     # Heating off has its own uncluttered interface. OFF is a mode, not a
     # temperature target, so do not show the current temperature or an arrow.
@@ -249,14 +255,7 @@ def sleeping_mug_display():
     """Swap every text field for the sleeping mug picture."""
     # The layout stacks the picture on top of the text. Each text field is
     # switched off here so nothing from the last screen shows through.
-    return {
-        "title": "",
-        "value": {"value": "", "enabled": False},
-        "current": {"value": "", "enabled": False},
-        "trend": {"value": "", "enabled": False},
-        "target": {"value": "", "enabled": False},
-        "mug": {"value": SLEEPING_MUG, "enabled": True},
-    }
+    return {"title": "", **hidden_fields(), "mug": {"value": SLEEPING_MUG, "enabled": True}}
 
 
 def feedback(ws, context, override=None, target_only=False, show_check=False, state=None):
@@ -303,13 +302,7 @@ def feedback(ws, context, override=None, target_only=False, show_check=False, st
 
 
 def message_feedback(ws, context, title, value):
-    display = {
-        "value": {"value": value, "enabled": True},
-        "current": {"value": "", "enabled": False},
-        "trend": {"value": "", "enabled": False},
-        "target": {"value": "", "enabled": False},
-        "mug": {"enabled": False},
-    }
+    display = {**hidden_fields(), "value": {"value": value, "enabled": True}}
     ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, **display}})
 
 
