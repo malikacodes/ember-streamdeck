@@ -1616,3 +1616,33 @@ def test_timings_have_names():
     # The loop reads these two names; the numbers are the ones it always used.
     assert plugin.STATUS_REFRESH_SECONDS == 2
     assert plugin.SELECTION_SETTLE_SECONDS == 3
+
+
+def count_status_reads_by_time(monkeypatch, timeline, state):
+    # Runs main() on a timeline and returns the steady-clock time of every
+    # status.json read, so a test can count the reads inside one tick.
+    reads = []
+
+    def counting_status():
+        reads.append(plugin.time.monotonic())
+        return state
+
+    monkeypatch.setattr(plugin, "status", counting_status)
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+    run_timed_main(monkeypatch, timeline)
+    return reads
+
+
+STATE = {"connected": True, "battery_percent": 80, "current_f": 100, "target_f": 130, "updated_ts": 0}
+
+
+def test_idle_ticks_do_not_read_status_when_no_dial_is_on_screen(monkeypatch):
+    # Protects the idle case: with no dial on screen there is nothing to draw,
+    # so reading and parsing status.json every 2 seconds is wasted work.
+    reads = count_status_reads_by_time(
+        monkeypatch,
+        [(2.5, plugin.socket.timeout()), (5.0, plugin.socket.timeout()), (7.5, plugin.socket.timeout())],
+        STATE,
+    )
+
+    assert reads == []

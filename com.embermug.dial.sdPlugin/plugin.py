@@ -445,6 +445,12 @@ def main():
             last_update = now
             continue
         if now - last_update >= STATUS_REFRESH_SECONDS:
+            # With no dial on screen there is nothing to draw, so skip the
+            # status.json read. willAppear syncs everything again when a
+            # dial comes back.
+            if not contexts:
+                last_update = now
+                continue
             # Do not let the normal refresh overwrite the target preview while
             # the user is still choosing a preset.
             if target_preview_until:
