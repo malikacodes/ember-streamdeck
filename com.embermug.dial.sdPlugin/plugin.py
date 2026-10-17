@@ -19,6 +19,7 @@ TARGET_PREVIEW_SECONDS = 1.5
 CHECKMARK_SECONDS = 3
 RECONNECT_TIMEOUT_SECONDS = 30
 CONNECTED_MESSAGE_SECONDS = 3
+NOT_APPLIED_MESSAGE_SECONDS = 3
 STATUS_REFRESH_SECONDS = 2 # How often the dial redraws from status.json
 SELECTION_SETTLE_SECONDS = 3 # After a dial action, wait this long before trusting status.json over my choice
 STATUS_STALE_SECONDS = 300
@@ -346,6 +347,11 @@ def main():
     reconnect_requested_at = None
     reconnect_started_at = None
     connected_message_until = 0.0
+    # The app reads command.json about once a second and drops it if the mug
+    # is offline, so a command can get lost without any error. pending_selection
+    # remembers what I asked for until status.json can be checked against it.
+    pending_selection = None
+    not_applied_until = 0.0
     target_preview_until = 0.0
     checkmark_until = 0.0
     was_at_target = None
@@ -382,6 +388,8 @@ def main():
                         last_update = now
                         continue
                     selected = new_selection
+                    pending_selection = new_selection
+                    not_applied_until = 0.0
                     last_action = now
                     target_preview_until = last_action + TARGET_PREVIEW_SECONDS
                     checkmark_until = 0.0
@@ -423,6 +431,8 @@ def main():
                         last_update = now
                         continue
                     selected = new_selection
+                    pending_selection = new_selection
+                    not_applied_until = 0.0
                     checkmark_until = 0.0
                     was_at_target = False
                     feedback(ws, context, selected)
@@ -453,6 +463,9 @@ def main():
             # status.json read. willAppear syncs everything again when a
             # dial comes back.
             if not contexts:
+                # Nobody is watching, so nobody should get a verdict on a
+                # command from before they left.
+                pending_selection = None
                 last_update = now
                 continue
             # Do not let the normal refresh overwrite the target preview while
@@ -484,8 +497,25 @@ def main():
                     message_feedback(ws, context, "CONNECTED", value)
                 last_update = now
                 continue
+            if now < not_applied_until:
+                for context in list(contexts):
+                    message_feedback(ws, context, "NOT APPLIED", "TRY AGAIN")
+                last_update = now
+                continue
             if now - last_action > SELECTION_SETTLE_SECONDS:
                 sync_selection(current_status)
+                if pending_selection is not None:
+                    # Time is up and status.json is the truth. If it still
+                    # disagrees, the app never took the command, so say so
+                    # before the dial falls back to what the mug is doing.
+                    if selected != pending_selection:
+                        not_applied_until = now + NOT_APPLIED_MESSAGE_SECONDS
+                        for context in list(contexts):
+                            message_feedback(ws, context, "NOT APPLIED", "TRY AGAIN")
+                        pending_selection = None
+                        last_update = now
+                        continue
+                    pending_selection = None
             at_target = is_at_target(current_status, selected)
             if at_target and not was_at_target:
                 checkmark_until = now + CHECKMARK_SECONDS

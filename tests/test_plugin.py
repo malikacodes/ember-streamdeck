@@ -1519,14 +1519,83 @@ def test_frame_cut_by_a_read_timeout_is_reassembled_on_the_next_read():
     assert websocket.receive() == {"event": "willAppear"}
 
 
-def test_rotation_the_app_never_applies_reverts_a_few_seconds_later(monkeypatch):
-    # Pins what happens today. I turn the dial to 130, the app ignores the
-    # command and status.json keeps saying 120. The dial shows 130, then
-    # quietly goes back to 120 a few seconds after the turn (3.7 s here, at the first refresh after 3 s), with no
-    # hint that the command did not land. What I want: say so on the dial.
-    # The "NOT APPLIED" change replaces this test.
-    monkeypatch.setattr(plugin, "status", lambda: {"target_f": 120})
+def not_applied_titles(websocket):
+    # Titles of every short message (title plus one line) the plugin drew.
+    return [
+        message["payload"]["title"]
+        for message in websocket.messages
+        if message.get("event") == "setFeedback" and message["payload"].get("title") == "NOT APPLIED"
+    ]
+
+
+def app_that_applies_after(monkeypatch, seconds, target_f=130):
+    # Fake status.json: says 120 until `seconds` of steady-clock time have
+    # passed, then says target_f. seconds=None means the app never applies it.
+    def status():
+        applied = seconds is not None and plugin.time.monotonic() >= seconds
+        return {"target_f": target_f if applied else 120}
+
+    monkeypatch.setattr(plugin, "status", status)
     monkeypatch.setattr(plugin, "set_temp", Mock())
+
+
+ROTATE_TO_130 = [
+    (0.0, {"event": "willAppear", "context": "dial-1"}),
+    (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+    (2.6, plugin.socket.timeout()),
+    (4.7, plugin.socket.timeout()),
+    (6.8, plugin.socket.timeout()),
+    (8.9, plugin.socket.timeout()),
+]
+
+
+def test_rotation_the_app_never_applies_says_not_applied_before_it_reverts(monkeypatch):
+    # I turn the dial to 130 and the app ignores it, so status.json keeps
+    # saying 120. Three seconds after the turn the dial says NOT APPLIED
+    # instead of quietly going back to 120, holds that for a few seconds,
+    # then shows the real 120.
+    app_that_applies_after(monkeypatch, None)
+
+    websocket = run_timed_main(monkeypatch, ROTATE_TO_130)
+
+    assert not_applied_titles(websocket) == ["NOT APPLIED", "NOT APPLIED"]
+    assert setfeedback_values(websocket) == ["120°", "130°", "130°", "TRY AGAIN", "TRY AGAIN", "120°"]
+
+
+def test_rotation_the_app_applies_in_time_never_says_not_applied(monkeypatch):
+    # The normal case. status.json agrees with the dial by the time the three
+    # seconds are up, so there is nothing to warn about.
+    app_that_applies_after(monkeypatch, 2.0)
+
+    websocket = run_timed_main(monkeypatch, ROTATE_TO_130)
+
+    assert not_applied_titles(websocket) == []
+    assert setfeedback_values(websocket)[-1] == "130°"
+
+
+def test_a_press_the_app_never_applies_says_not_applied(monkeypatch):
+    # Same check for the press that switches heating off: status.json keeps
+    # saying 120 (heating on) after I asked for OFF.
+    app_that_applies_after(monkeypatch, None, target_f=0)
+    plugin.selected = 120
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, {"event": "dialDown", "context": "dial-1"}),
+            (1.1, {"event": "dialUp", "context": "dial-1"}),
+            (4.5, plugin.socket.timeout()),
+        ],
+    )
+
+    assert not_applied_titles(websocket) == ["NOT APPLIED"]
+
+
+def test_turning_the_dial_again_clears_the_not_applied_message(monkeypatch):
+    # A new turn is a new command, so the old warning goes and the dial shows
+    # the new target straight away (from the 120 the mug really has).
+    app_that_applies_after(monkeypatch, None)
 
     websocket = run_timed_main(
         monkeypatch,
@@ -1535,10 +1604,15 @@ def test_rotation_the_app_never_applies_reverts_a_few_seconds_later(monkeypatch)
             (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
             (2.6, plugin.socket.timeout()),
             (4.7, plugin.socket.timeout()),
+            (5.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (6.5, plugin.socket.timeout()),
+            (7.0, plugin.socket.timeout()),
         ],
     )
 
-    assert setfeedback_values(websocket) == ["120°", "130°", "130°", "120°"]
+    assert not_applied_titles(websocket) == ["NOT APPLIED"]
+    # The dial had gone back to the real 120, so the new turn starts there.
+    assert setfeedback_values(websocket)[-2:] == ["130°", "130°"]
 
 
 @pytest.fixture
@@ -1690,3 +1764,24 @@ def test_target_preview_expiry_reads_status_once(monkeypatch):
     reads = count_status_reads_by_time(monkeypatch, timeline, STATE)
 
     assert reads.count(2.6) == 1
+
+
+def test_a_dial_that_comes_back_does_not_get_a_verdict_on_an_old_command(monkeypatch):
+    # I turn the dial, switch pages before the check, and come back later.
+    # The command is old news by then, so no NOT APPLIED on return.
+    app_that_applies_after(monkeypatch, None)
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (1.5, {"event": "willDisappear", "context": "dial-1"}),
+            (3.0, plugin.socket.timeout()),
+            (5.5, plugin.socket.timeout()),
+            (6.0, {"event": "willAppear", "context": "dial-1"}),
+            (9.0, plugin.socket.timeout()),
+        ],
+    )
+
+    assert not_applied_titles(websocket) == []
