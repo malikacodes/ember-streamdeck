@@ -75,8 +75,9 @@ def finite_number(value):
     return number if math.isfinite(number) else None
 
 
-def target_f():
-    value = finite_number(status().get("target_f"))
+def target_f(state=None):
+    state = status() if state is None else state
+    value = finite_number(state.get("target_f"))
     return value if value is not None else 0.0
 
 
@@ -257,10 +258,12 @@ def sleeping_mug_display():
     }
 
 
-def feedback(ws, context, override=None, target_only=False, show_check=False):
-    state = status()
+def feedback(ws, context, override=None, target_only=False, show_check=False, state=None):
+    # A caller redrawing several dials passes the status it already read, so
+    # one tick is one read of status.json instead of one per dial.
+    state = status() if state is None else state
     connected = state.get("connected") is True and not status_is_stale(state)
-    target = target_f() if override is None else override
+    target = target_f(state) if override is None else override
     battery = finite_number(state.get("battery_percent"))
     if connected and battery is not None:
         charging = " ⚡" if state.get("charging") is True else ""
@@ -320,9 +323,9 @@ def send_temp_command(ws, context, fahrenheit):
     return True
 
 
-def sync_selection():
+def sync_selection(state=None):
     global selected
-    actual = target_f()
+    actual = target_f(state)
     selected = 0 if actual < 1 else PRESETS[min(range(len(PRESETS)), key=lambda i: abs(PRESETS[i] - actual))]
 
 
@@ -427,8 +430,9 @@ def main():
             # The target-reached check is a brief confirmation, not a
             # permanent part of the temperature display.
             checkmark_until = 0.0
+            current_status = status()
             for context in list(contexts):
-                feedback(ws, context, selected)
+                feedback(ws, context, selected, state=current_status)
             last_update = now
             continue
         if target_preview_until and now >= target_preview_until:
@@ -441,10 +445,16 @@ def main():
                 checkmark_until = now + CHECKMARK_SECONDS
             was_at_target = at_target
             for context in list(contexts):
-                feedback(ws, context, selected, show_check=now < checkmark_until)
+                feedback(ws, context, selected, show_check=now < checkmark_until, state=current_status)
             last_update = now
             continue
         if now - last_update >= STATUS_REFRESH_SECONDS:
+            # With no dial on screen there is nothing to draw, so skip the
+            # status.json read. willAppear syncs everything again when a
+            # dial comes back.
+            if not contexts:
+                last_update = now
+                continue
             # Do not let the normal refresh overwrite the target preview while
             # the user is still choosing a preset.
             if target_preview_until:
@@ -457,7 +467,7 @@ def main():
                     reconnect_requested_at = None
                     reconnect_started_at = None
                     connected_message_until = now + CONNECTED_MESSAGE_SECONDS
-                    sync_selection()
+                    sync_selection(current_status)
                 elif now - reconnect_started_at >= RECONNECT_TIMEOUT_SECONDS:
                     # Stop showing an endless reconnect message. The normal
                     # feedback will explain that the mug is still offline.
@@ -475,7 +485,7 @@ def main():
                 last_update = now
                 continue
             if now - last_action > SELECTION_SETTLE_SECONDS:
-                sync_selection()
+                sync_selection(current_status)
             at_target = is_at_target(current_status, selected)
             if at_target and not was_at_target:
                 checkmark_until = now + CHECKMARK_SECONDS
@@ -483,7 +493,7 @@ def main():
                 checkmark_until = 0.0
             was_at_target = at_target
             for context in list(contexts):
-                feedback(ws, context, selected, show_check=now < checkmark_until)
+                feedback(ws, context, selected, show_check=now < checkmark_until, state=current_status)
             last_update = now
 
 

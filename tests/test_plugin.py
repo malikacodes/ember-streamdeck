@@ -657,7 +657,7 @@ def test_send_temp_command_reports_filesystem_failure_without_crashing(monkeypat
     [(0, 0), (119, 120), (126, 130), (138, 140), (144, 145)],
 )
 def test_sync_selection_chooses_nearest_preset(monkeypatch, actual, expected):
-    monkeypatch.setattr(plugin, "target_f", lambda: actual)
+    monkeypatch.setattr(plugin, "target_f", lambda state=None: actual)
 
     plugin.sync_selection()
 
@@ -1616,3 +1616,77 @@ def test_timings_have_names():
     # The loop reads these two names; the numbers are the ones it always used.
     assert plugin.STATUS_REFRESH_SECONDS == 2
     assert plugin.SELECTION_SETTLE_SECONDS == 3
+
+
+def count_status_reads_by_time(monkeypatch, timeline, state):
+    # Runs main() on a timeline and returns the steady-clock time of every
+    # status.json read, so a test can count the reads inside one tick.
+    reads = []
+
+    def counting_status():
+        reads.append(plugin.time.monotonic())
+        return state
+
+    monkeypatch.setattr(plugin, "status", counting_status)
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+    run_timed_main(monkeypatch, timeline)
+    return reads
+
+
+STATE = {"connected": True, "battery_percent": 80, "current_f": 100, "target_f": 130, "updated_ts": 0}
+
+
+def test_idle_ticks_do_not_read_status_when_no_dial_is_on_screen(monkeypatch):
+    # Protects the idle case: with no dial on screen there is nothing to draw,
+    # so reading and parsing status.json every 2 seconds is wasted work.
+    reads = count_status_reads_by_time(
+        monkeypatch,
+        [(2.5, plugin.socket.timeout()), (5.0, plugin.socket.timeout()), (7.5, plugin.socket.timeout())],
+        STATE,
+    )
+
+    assert reads == []
+
+
+def test_a_dial_that_comes_back_is_drawn_again_straight_away(monkeypatch):
+    # Protects the other half of the idle skip: while the dial is away nothing
+    # is read, and willAppear draws it the moment it returns.
+    reads = count_status_reads_by_time(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, {"event": "willDisappear", "context": "dial-1"}),
+            (2.5, plugin.socket.timeout()),
+            (5.0, plugin.socket.timeout()),
+            (6.0, {"event": "willAppear", "context": "dial-1"}),
+        ],
+        STATE,
+    )
+
+    assert [time for time in reads if 1.0 < time < 6.0] == []
+    assert any(time == 6.0 for time in reads)
+
+
+@pytest.mark.parametrize("dials", [1, 2])
+def test_a_refresh_tick_reads_status_once_however_many_dials_are_showing(monkeypatch, dials):
+    # Protects the cost of a tick: one read, shared by the checkmark logic,
+    # the selection sync and every dial. t=5.0 is past the 3 s settle time,
+    # so the sync path runs too.
+    appear = [(0.0, {"event": "willAppear", "context": f"dial-{n}"}) for n in range(dials)]
+    reads = count_status_reads_by_time(monkeypatch, appear + [(5.0, plugin.socket.timeout())], STATE)
+
+    assert reads.count(5.0) == 1
+
+
+def test_target_preview_expiry_reads_status_once(monkeypatch):
+    # Same protection for the other timer: when the target preview ends,
+    # both dials redraw from one read.
+    timeline = [
+        (0.0, {"event": "willAppear", "context": "dial-1"}),
+        (0.0, {"event": "willAppear", "context": "dial-2"}),
+        (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+        (2.6, plugin.socket.timeout()),
+    ]
+    reads = count_status_reads_by_time(monkeypatch, timeline, STATE)
+
+    assert reads.count(2.6) == 1
