@@ -1785,3 +1785,56 @@ def test_a_dial_that_comes_back_does_not_get_a_verdict_on_an_old_command(monkeyp
     )
 
     assert not_applied_titles(websocket) == []
+
+
+def test_every_screen_builds_the_same_five_fields_exactly():
+    # Protects the shape Stream Deck receives. The "all fields off" block is
+    # written out in more than one place, and this pins each screen's exact
+    # payload so folding the copies together cannot change a key or a value.
+    ws = FeedbackSocket()
+    off = {"value": "", "enabled": False}
+
+    plugin.message_feedback(ws, "dial-1", "RECONNECTING…", "…")
+    assert ws.messages[-1]["payload"] == {
+        "title": "RECONNECTING…",
+        "value": {"value": "…", "enabled": True},
+        "current": off,
+        "trend": off,
+        "target": off,
+        "mug": {"enabled": False},
+    }
+    assert plugin.temperature_display({}, 0) == {
+        "value": {"value": "OFF", "enabled": True},
+        "current": off,
+        "trend": off,
+        "target": off,
+        "mug": {"enabled": False},
+    }
+    assert plugin.sleeping_mug_display() == {
+        "title": "",
+        "value": off,
+        "current": off,
+        "trend": off,
+        "target": off,
+        "mug": {"value": plugin.SLEEPING_MUG, "enabled": True},
+    }
+
+
+def test_short_messages_reach_every_dial_on_screen(monkeypatch):
+    # Protects the loops that draw one message on all dials: with two dials
+    # showing, NOT APPLIED has to land on both, not just the one I turned.
+    app_that_applies_after(monkeypatch, None)
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (0.0, {"event": "willAppear", "context": "dial-2"}),
+            (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (2.6, plugin.socket.timeout()),
+            (4.7, plugin.socket.timeout()),
+        ],
+    )
+
+    warned = [m["context"] for m in websocket.messages if m.get("payload", {}).get("title") == "NOT APPLIED"]
+    assert sorted(warned) == ["dial-1", "dial-2"]
