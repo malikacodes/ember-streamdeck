@@ -32,6 +32,8 @@ class FakeSocket:
         if not self.chunks:
             return b""
         chunk = self.chunks.pop(0)
+        if isinstance(chunk, BaseException):
+            raise chunk
         if len(chunk) > count:
             self.chunks.insert(0, chunk[count:])
             return chunk[:count]
@@ -1460,3 +1462,80 @@ def test_main_reports_reconnect_launch_failure_without_crashing(monkeypatch, err
         message.get("payload", {}).get("title") == expected_title
         for message in websocket.messages
     )
+
+
+def setfeedback_values(websocket):
+    # The big number on the dial in every setFeedback the plugin sent, in order.
+    return [
+        message["payload"]["value"]["value"]
+        for message in websocket.messages
+        if message.get("event") == "setFeedback" and "value" in message["payload"]
+    ]
+
+
+def test_nothing_is_drawn_until_a_dial_has_appeared(monkeypatch):
+    # Protects the "no dial on screen" case: Stream Deck only gets a
+    # setFeedback for a context it told us about with willAppear. Without one,
+    # ticks pass and the plugin sends nothing.
+    monkeypatch.setattr(plugin, "status", lambda: {"connected": True, "target_f": 130, "battery_percent": 80})
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [(0.0, plugin.socket.timeout()), (2.5, plugin.socket.timeout()), (5.0, plugin.socket.timeout())],
+    )
+
+    # Only the registration message goes out.
+    assert [message["event"] for message in websocket.messages] == ["registerPlugin"]
+
+
+def test_frame_cut_by_a_read_timeout_loses_its_first_bytes():
+    # Pins what happens today: the 0.25 s timeout can hit between the two
+    # halves of one frame. The bytes already read are dropped, so the next
+    # receive() starts in the middle of the frame. Loopback almost never
+    # splits a frame, so I left it. See the xfail test below for what I want.
+    frame = server_frame(1, b'{"event":"willAppear"}')
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket([frame[:2], plugin.socket.timeout(), frame[2:]])
+
+    with pytest.raises(plugin.socket.timeout):
+        websocket.receive()
+    # The 2-byte header is gone: the leftover payload now reads as a header,
+    # asks for more bytes than are left, and the socket looks closed.
+    with pytest.raises(EOFError):
+        websocket.receive()
+
+
+@pytest.mark.xfail(strict=True, raises=EOFError, reason="a frame split by a read timeout is not reassembled yet")
+def test_frame_cut_by_a_read_timeout_is_reassembled_on_the_next_read():
+    # What I want: a timeout mid-frame keeps the bytes already read, and the
+    # next receive() finishes the same frame.
+    frame = server_frame(1, b'{"event":"willAppear"}')
+    websocket = plugin.WebSocket.__new__(plugin.WebSocket)
+    websocket.sock = FakeSocket([frame[:2], plugin.socket.timeout(), frame[2:]])
+
+    with pytest.raises(plugin.socket.timeout):
+        websocket.receive()
+
+    assert websocket.receive() == {"event": "willAppear"}
+
+
+def test_rotation_the_app_never_applies_reverts_a_few_seconds_later(monkeypatch):
+    # Pins what happens today. I turn the dial to 130, the app ignores the
+    # command and status.json keeps saying 120. The dial shows 130, then
+    # quietly goes back to 120 a few seconds after the turn (3.7 s here, at the first refresh after 3 s), with no
+    # hint that the command did not land. What I want: say so on the dial.
+    # The "NOT APPLIED" change replaces this test.
+    monkeypatch.setattr(plugin, "status", lambda: {"target_f": 120})
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1}}),
+            (2.6, plugin.socket.timeout()),
+            (4.7, plugin.socket.timeout()),
+        ],
+    )
+
+    assert setfeedback_values(websocket) == ["120°", "130°", "130°", "120°"]
