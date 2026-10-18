@@ -1539,3 +1539,80 @@ def test_rotation_the_app_never_applies_reverts_a_few_seconds_later(monkeypatch)
     )
 
     assert setfeedback_values(websocket) == ["120°", "130°", "130°", "120°"]
+
+
+@pytest.fixture
+def log_file(tmp_path, monkeypatch):
+    # Keeps the tests away from the real ~/Library/Logs/EmberMug, and takes
+    # the file handler back off the logger afterwards.
+    path = tmp_path / "logs" / "plugin.log"
+    monkeypatch.setattr(plugin, "LOG_FILE", path)
+    yield path
+    for handler in list(plugin.log.handlers):
+        plugin.log.removeHandler(handler)
+        handler.close()
+
+
+@pytest.mark.parametrize("hangup", [EOFError, BrokenPipeError, ConnectionResetError])
+def test_run_exits_quietly_when_stream_deck_closes_the_socket(monkeypatch, log_file, hangup):
+    # Protects the Stream Deck quit case: a closed socket (politely, or
+    # abruptly with a reset or broken pipe) is a normal goodbye, so exit code
+    # 0 and one plain line in the log, no traceback.
+    monkeypatch.setattr(plugin, "main", Mock(side_effect=hangup))
+
+    with pytest.raises(SystemExit) as exit_info:
+        plugin.run()
+
+    assert exit_info.value.code == 0
+    text = log_file.read_text(encoding="utf-8")
+    assert "Stream Deck closed the connection" in text
+    assert "Traceback" not in text
+
+
+def test_run_logs_the_traceback_and_exits_1_on_a_real_crash(monkeypatch, log_file):
+    # Protects the real-crash case: it still exits 1 so Stream Deck notices,
+    # and the traceback lands in the log file instead of nowhere.
+    monkeypatch.setattr(plugin, "main", Mock(side_effect=RuntimeError("boom")))
+
+    with pytest.raises(SystemExit) as exit_info:
+        plugin.run()
+
+    assert exit_info.value.code == 1
+    text = log_file.read_text(encoding="utf-8")
+    assert "Traceback" in text
+    assert "RuntimeError: boom" in text
+
+
+def test_run_still_starts_when_the_log_folder_cannot_be_made(monkeypatch, tmp_path):
+    # Protects the plugin from its own log: if the folder is blocked (here a
+    # plain file sits where the folder should be), the plugin runs anyway.
+    blocker = tmp_path / "logs"
+    blocker.write_text("not a folder")
+    monkeypatch.setattr(plugin, "LOG_FILE", blocker / "plugin.log")
+    main = Mock(side_effect=EOFError)
+    monkeypatch.setattr(plugin, "main", main)
+
+    with pytest.raises(SystemExit) as exit_info:
+        plugin.run()
+
+    assert exit_info.value.code == 0
+    main.assert_called_once()
+
+
+def test_failed_command_write_is_logged_with_its_traceback(monkeypatch, log_file):
+    # Protects the "COMMAND FAILED" dial message: the reason (disk full,
+    # permissions) now has somewhere to go.
+    plugin.setup_logging()
+    monkeypatch.setattr(plugin, "set_temp", Mock(side_effect=OSError("disk full")))
+
+    plugin.send_temp_command(FeedbackSocket(), "dial-1", 130)
+
+    text = log_file.read_text(encoding="utf-8")
+    assert "disk full" in text
+    assert "Traceback" in text
+
+
+def test_timings_have_names():
+    # The loop reads these two names; the numbers are the ones it always used.
+    assert plugin.STATUS_REFRESH_SECONDS == 2
+    assert plugin.SELECTION_SETTLE_SECONDS == 3

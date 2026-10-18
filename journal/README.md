@@ -10,3 +10,4 @@ This is the part where I keep the real story of building this project. Not just 
 | 04 | October 12, 2026 | [The dial shows where my drink is going](04-where-my-drink-is-going.md) |
 | 05 | October 12, 2026 | [The mug goes to sleep](05-the-mug-goes-to-sleep.md) |
 | 06 | October 17, 2026 | [Three things I was not sure about](06-three-things-i-was-not-sure-about.md) |
+| 07 | October 17, 2026 | [The plugin gets a diary](07-the-plugin-gets-a-diary.md) |

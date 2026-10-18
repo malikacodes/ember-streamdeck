@@ -2,6 +2,8 @@
 import base64
 import hashlib
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
 from pathlib import Path
@@ -17,14 +19,32 @@ TARGET_PREVIEW_SECONDS = 1.5
 CHECKMARK_SECONDS = 3
 RECONNECT_TIMEOUT_SECONDS = 30
 CONNECTED_MESSAGE_SECONDS = 3
+STATUS_REFRESH_SECONDS = 2 # How often the dial redraws from status.json
+SELECTION_SETTLE_SECONDS = 3 # After a dial action, wait this long before trusting status.json over my choice
 STATUS_STALE_SECONDS = 300
 SUPPORT = Path.home() / "Library/Application Support/EmberMug"
 STATUS = SUPPORT / "status.json" # Mug data read from the Ember menu-bar app
 COMMAND = SUPPORT / "command.json" # Commands to control the Ember menu-bar app
 SLEEPING_MUG = "imgs/sleeping-mug.svg" # Shown when the mug is offline and heating is off
+LOG_FILE = Path.home() / "Library/Logs/EmberMug/plugin.log"
 EMBER_APP = Path.home() / "Applications/Ember Mug.app"
+log = logging.getLogger("embermug")
 selected = None # Current dial preset; none until the plugin initializes
 last_action = 0.0  # Time of the most recent dial action
+
+
+def setup_logging():
+    # Stream Deck throws away everything a plugin prints, so the log file is
+    # the only place a crash can leave a note. Small and rotating, so it never
+    # grows into a surprise. If the folder is blocked the plugin still runs.
+    log.setLevel(logging.INFO)
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(LOG_FILE, maxBytes=200_000, backupCount=1, encoding="utf-8")
+    except OSError:
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(handler)
 
 
 def atomic_json(path, value):
@@ -294,6 +314,7 @@ def send_temp_command(ws, context, fahrenheit):
     try:
         set_temp(fahrenheit)
     except OSError:
+        log.exception("Could not write command.json")
         message_feedback(ws, context, "COMMAND FAILED", "TRY AGAIN")
         return False
     return True
@@ -377,10 +398,12 @@ def main():
                     try:
                         request_reconnect()
                     except FileNotFoundError:
+                        log.exception("Ember app not found")
                         message_feedback(ws, context, "APP NOT FOUND", "REINSTALL APP")
                         last_update = now
                         continue
                     except OSError:
+                        log.exception("Could not open the Ember app")
                         message_feedback(ws, context, "RECONNECT FAILED", "TRY AGAIN")
                         last_update = now
                         continue
@@ -421,7 +444,7 @@ def main():
                 feedback(ws, context, selected, show_check=now < checkmark_until)
             last_update = now
             continue
-        if now - last_update >= 2:
+        if now - last_update >= STATUS_REFRESH_SECONDS:
             # Do not let the normal refresh overwrite the target preview while
             # the user is still choosing a preset.
             if target_preview_until:
@@ -451,7 +474,7 @@ def main():
                     message_feedback(ws, context, "CONNECTED", value)
                 last_update = now
                 continue
-            if now - last_action > 3:
+            if now - last_action > SELECTION_SETTLE_SECONDS:
                 sync_selection()
             at_target = is_at_target(current_status, selected)
             if at_target and not was_at_target:
@@ -464,5 +487,20 @@ def main():
             last_update = now
 
 
+def run():
+    setup_logging()
+    try:
+        main()
+    except (EOFError, BrokenPipeError, ConnectionResetError):
+        # Stream Deck closing the socket is how it says goodbye when it quits.
+        # Sometimes it hangs up abruptly (reset, broken pipe) instead of
+        # politely. None of that is a crash, so it exits 0 and leaves one line, not an alarm.
+        log.info("Stream Deck closed the connection, exiting")
+        sys.exit(0)
+    except Exception:
+        log.exception("Plugin crashed")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    run()
