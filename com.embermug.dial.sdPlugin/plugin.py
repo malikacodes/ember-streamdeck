@@ -23,6 +23,8 @@ NOT_APPLIED_MESSAGE_SECONDS = 3
 STATUS_REFRESH_SECONDS = 2 # How often the dial redraws from status.json
 SELECTION_SETTLE_SECONDS = 3 # After a dial action, wait this long before trusting status.json over my choice
 STATUS_STALE_SECONDS = 300
+HANDSHAKE_SECONDS = 30 # How long to wait for Stream Deck to answer the plugin's hello
+PREVIEW_GAP_SECONDS = 0.1 # A spinning dial draws at most this often (ten a second)
 SUPPORT = Path.home() / "Library/Application Support/EmberMug"
 STATUS = SUPPORT / "status.json" # Mug data read from the Ember menu-bar app
 COMMAND = SUPPORT / "command.json" # Commands to control the Ember menu-bar app
@@ -61,6 +63,10 @@ WARMING = "#FF5A5F"
 COOLING = "#3B9CFF"
 selected = None # Current dial preset; none until the plugin initializes
 last_action = 0.0  # Time of the most recent dial action
+# The last strip each dial was sent, so an unchanged one isn't sent again.
+# Stream Deck takes about ten pictures a second for the whole plugin, and
+# the two second refresh was spending some of them on nothing.
+strips_shown = {}
 
 
 def setup_logging():
@@ -145,9 +151,19 @@ class WebSocket:
             "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
         ) % (port, key)
         self.sock.sendall(request.encode())
+        # Right after a restart Stream Deck can take about five seconds to
+        # answer. With a five second limit the plugin sometimes gave up
+        # first, crashed, and sat dead for ten seconds until Stream Deck
+        # tried again. Thirty is plenty and still ends a real hang.
+        self.sock.settimeout(HANDSHAKE_SECONDS)
         response = b""
         while b"\r\n\r\n" not in response:
-            response += self.sock.recv(4096)
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                # Hung up mid-handshake. Without this check an empty read
+                # would loop here forever.
+                raise EOFError
+            response += chunk
         expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         if b"101" not in response.split(b"\r\n", 1)[0] or expected not in response:
             raise RuntimeError("Stream Deck WebSocket handshake failed")
@@ -296,7 +312,7 @@ def feedback(ws, context, override=None, target_only=False, show_check=False, st
     if target < 1:
         # Off is off. Connected or not, the dial shows one sleeping mug
         # instead of a drink cooling down degree by degree.
-        ws.send({"event": "setFeedback", "context": context, "payload": sleeping_mug_display()})
+        show_strip(ws, context, sleeping_mug_display())
         return
     battery = finite_number(state.get("battery_percent"))
     if connected and battery is not None:
@@ -326,12 +342,19 @@ def feedback(ws, context, override=None, target_only=False, show_check=False, st
     else:
         title = "CONNECTED" if connected else "OFFLINE"
         display = temperature_display(state, target) if connected else temperature_display({}, target)
-    ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, **display}})
+    show_strip(ws, context, {"title": title, **display})
 
 
 def message_feedback(ws, context, title, value):
     display = {**hidden_fields(), "value": {"value": value, "enabled": True}}
-    ws.send({"event": "setFeedback", "context": context, "payload": {"title": title, **display}})
+    show_strip(ws, context, {"title": title, **display})
+
+
+def show_strip(ws, context, payload):
+    if strips_shown.get(context) == payload:
+        return
+    strips_shown[context] = payload
+    ws.send({"event": "setFeedback", "context": context, "payload": payload})
 
 
 def redraw_all(ws, contexts, *args, message=None, **kwargs):
@@ -447,9 +470,38 @@ def send_temp_command(ws, context, fahrenheit):
 
 
 def sync_selection(state=None):
+    # The mug's own target, to the whole degree. It used to snap to the
+    # nearest preset, but push-and-turn can pick any degree, and snapping
+    # 137° to 140° would call a command that worked "not applied".
     global selected
     actual = target_f(state)
-    selected = 0 if actual < 1 else PRESETS[min(range(len(PRESETS)), key=lambda i: abs(PRESETS[i] - actual))]
+    selected = 0 if actual < 1 else round(actual)
+
+
+def turned_to(current, ticks, fine=False):
+    """Where a turn of the dial lands, from the temp it started on.
+
+    A plain turn moves between the presets. A push-and-turn moves one
+    degree per click. Both stay inside the presets' range.
+    """
+    low, high = PRESETS[0], PRESETS[-1]
+    if not current or current < 1:
+        # Heating off is outside the range. The first click comes in at
+        # the bottom going clockwise, at the top going counterclockwise.
+        current = low if ticks > 0 else high
+        ticks -= 1 if ticks > 0 else -1
+        if not ticks:
+            return current
+    if fine:
+        return max(low, min(high, round(current) + ticks))
+    # The preset this many clicks past where I am. From an in-between temp
+    # like 137°, the first click lands on the next preset that way (140°
+    # or 130°), and turning past either end stays at the end.
+    if ticks > 0:
+        ahead = [preset for preset in PRESETS if preset > current]
+        return ahead[min(ticks, len(ahead)) - 1] if ahead else high
+    behind = [preset for preset in reversed(PRESETS) if preset < current]
+    return behind[min(-ticks, len(behind)) - 1] if behind else low
 
 
 def main():
@@ -485,14 +537,20 @@ def main():
     checkmark_until = 0.0
     was_at_target = None
     last_update = 0.0
+    # A fast spin used to send a picture per click, 40 a second, at a deck
+    # that takes about ten. Now the turned dial draws at most once per
+    # PREVIEW_GAP_SECONDS. A click inside that gap leaves the picture owed,
+    # and the loop draws it with the newest number once the gap is over.
+    preview_drawn_at = 0.0
+    preview_owed = None
 
-    def choose(new_selection, now, sent_from=None):
+    def choose(new_selection, now, sent_from=None, turning=False):
         # Every way of picking a temp, a turn, a push or a key, leaves the
         # same trail: what I asked for and when, so "not applied" can check
         # it later, and a clean slate for the check mark. A new choice
         # replaces any old "Sent" on the keys, and sent_from is the Set Temp
-        # key that made this one. The keys redraw right away so a turn of
-        # the dial shows on them too.
+        # key that made this one. The keys redraw right away, except during
+        # a turn: they catch up once when the dial stops.
         global selected, last_action
         nonlocal pending_selection, not_applied_until, checkmark_until, was_at_target
         selected = new_selection
@@ -505,7 +563,8 @@ def main():
             key["notice"] = None
         if sent_from in keys:
             keys[sent_from]["notice"] = "Sent"
-        draw_keys(ws, keys, now=now)
+        if not turning:
+            draw_keys(ws, keys, now=now)
 
     while True:
         try:
@@ -524,6 +583,10 @@ def main():
                 draw_keys(ws, {context: keys[context]})
             elif name == "willAppear" and context:
                 contexts.add(context)
+                # A dial coming back on screen (a page change, waking up)
+                # starts blank, so it has to be sent its strip even if it
+                # matches the last one.
+                strips_shown.pop(context, None)
                 sync_selection()
                 was_at_target = is_at_target(status(), selected)
                 feedback(ws, context, selected)
@@ -531,6 +594,7 @@ def main():
                 contexts.discard(context)
                 keys.pop(context, None)
                 press_started.pop(context, None)
+                strips_shown.pop(context, None)
             elif name == "didReceiveSettings" and context in keys:
                 # A new temp picked on the settings page shows straight away.
                 keys[context]["settings"] = settings
@@ -568,22 +632,29 @@ def main():
                 choose(new_selection, now, sent_from=context if key["action"] == TEMP else None)
                 redraw_all(ws, contexts, selected)
             elif name == "dialRotate" and context:
-                ticks = int(event.get("payload", {}).get("ticks", 0))
+                payload = event.get("payload", {})
+                ticks = int(payload.get("ticks", 0))
+                # Stream Deck says when the dial is held down while it turns.
+                # That's push-and-turn: one degree per click. It also means
+                # the push was for turning, so letting go mustn't count as a
+                # press (heating off) or a hold (reconnect). Forgetting when
+                # the push started is what makes dialUp skip it.
+                fine = payload.get("pressed") is True
+                if fine:
+                    press_started.pop(context, None)
                 if ticks:
-                    if selected in PRESETS:
-                        index = PRESETS.index(selected) + ticks
-                    else:
-                        # Heating off is outside the preset list. Clockwise
-                        # enters at 120°F; counterclockwise enters at 145°F.
-                        index = (-1 if ticks > 0 else len(PRESETS)) + ticks
-                    index = max(0, min(len(PRESETS) - 1, index))
-                    new_selection = PRESETS[index]
+                    new_selection = turned_to(selected, ticks, fine)
                     if not send_temp_command(ws, context, new_selection):
                         last_update = now
                         continue
-                    choose(new_selection, now)
+                    choose(new_selection, now, turning=True)
                     target_preview_until = now + TARGET_PREVIEW_SECONDS
-                    feedback(ws, context, selected, target_only=True)
+                    if now - preview_drawn_at >= PREVIEW_GAP_SECONDS:
+                        feedback(ws, context, selected, target_only=True)
+                        preview_drawn_at = now
+                        preview_owed = None
+                    else:
+                        preview_owed = context
             elif name == "dialDown" and context:
                 # Do not toggle heating yet. We must wait for dial-up so a
                 # quick press can be distinguished from a reconnect hold.
@@ -621,6 +692,11 @@ def main():
                         continue
                     choose(new_selection, now)
                     feedback(ws, context, selected)
+        if preview_owed and now - preview_drawn_at >= PREVIEW_GAP_SECONDS:
+            if preview_owed in contexts and target_preview_until:
+                feedback(ws, preview_owed, selected, target_only=True)
+            preview_drawn_at = now
+            preview_owed = None
         if checkmark_until and now >= checkmark_until:
             # The target-reached check is a brief confirmation, not a
             # permanent part of the temperature display.
@@ -633,12 +709,15 @@ def main():
             # The user has stopped turning the dial. Replace the large target
             # preview with the live current-temperature-to-target comparison.
             target_preview_until = 0.0
+            preview_owed = None
             current_status = status()
             at_target = is_at_target(current_status, selected)
             if at_target and not was_at_target:
                 checkmark_until = now + CHECKMARK_SECONDS
             was_at_target = at_target
             redraw_all(ws, contexts, selected, show_check=now < checkmark_until, state=current_status)
+            # The keys sat out the turn, so they catch up here, once.
+            draw_keys(ws, keys, current_status, now)
             last_update = now
             continue
         if now - last_update >= STATUS_REFRESH_SECONDS:

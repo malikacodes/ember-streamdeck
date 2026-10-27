@@ -154,6 +154,8 @@ Rotation moves through:
 120°F ↔ 130°F ↔ 140°F ↔ 145°F
 ```
 
+Pushing the dial down while I turn it moves one degree per click instead, anywhere from 120°F to 145°F, for when 140 is a little too hot and 130 is a little too sad. Letting go after a push-and-turn doesn't count as a press, so it never turns heating off or starts a reconnect by accident. A plain turn from an in-between temperature like 137°F goes to the next preset that way.
+
 Pressing toggles:
 
 ```text
@@ -288,4 +290,4 @@ This is an unofficial personal project. It is not affiliated with or endorsed by
 
 I wanted to control my Ember Mug with a Stream Deck dial. The first Python library could change the temperature, but reconnecting to the mug for every command was unreliable. I used a macOS menu-bar app to keep the Bluetooth connection running, then built this Stream Deck plugin to send commands to that app.
 
-Turning the dial moves between **120°F, 130°F, 140°F, and 145°F**. Pressing it turns heating off, and pressing it again turns heating back on at my default of **145°F**. Holding it reconnects the mug. The Stream Deck screen also shows the current and target temperatures, heating or cooling direction, battery percentage, and whether the mug is charging.
+Turning the dial moves between **120°F, 130°F, 140°F, and 145°F**, and pushing while turning moves one degree at a time. Pressing it turns heating off, and pressing it again turns heating back on at my default of **145°F**. Holding it reconnects the mug. The Stream Deck screen also shows the current and target temperatures, heating or cooling direction, battery percentage, and whether the mug is charging.

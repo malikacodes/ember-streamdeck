@@ -58,6 +58,7 @@ class FeedbackSocket:
 def reset_plugin_state():
     plugin.selected = None
     plugin.last_action = 0.0
+    plugin.strips_shown.clear()
 
 
 def load_manifest():
@@ -630,11 +631,14 @@ def test_send_temp_command_reports_filesystem_failure_without_crashing(monkeypat
     assert payload["value"]["value"] == "TRY AGAIN"
 
 
+# The dial keeps the mug's own target to the whole degree. Snapping 137°
+# to 140° would make a push-and-turn look "not applied" when it worked.
+# Celsius round trips land a hair off (144.996°), so it rounds.
 @pytest.mark.parametrize(
     ("actual", "expected"),
-    [(0, 0), (119, 120), (126, 130), (138, 140), (144, 145)],
+    [(0, 0), (126, 126), (137, 137), (144.996, 145), (120.2, 120)],
 )
-def test_sync_selection_chooses_nearest_preset(monkeypatch, actual, expected):
+def test_sync_selection_keeps_the_mugs_own_degree(monkeypatch, actual, expected):
     monkeypatch.setattr(plugin, "target_f", lambda state=None: actual)
 
     plugin.sync_selection()
@@ -761,6 +765,34 @@ def test_websocket_handshake_connects_and_sets_short_timeout(monkeypatch):
     create_connection.assert_called_once_with(("127.0.0.1", 4321), timeout=5)
     assert sock.timeout == 0.25
     assert b"GET / HTTP/1.1" in sock.sent[0]
+
+
+# Stream Deck can take about five seconds to answer after a restart, so
+# the handshake has to wait longer than that or the plugin crashes.
+def test_websocket_handshake_waits_longer_than_stream_decks_slow_start(monkeypatch):
+    waits = []
+
+    class SlowStart(FakeSocket):
+        def recv(self, count):
+            waits.append(self.timeout)
+            return super().recv(count)
+
+    sock = SlowStart([b"HTTP/1.1 403 Forbidden\r\n\r\n"])
+    monkeypatch.setattr(plugin.socket, "create_connection", lambda *args, **kwargs: sock)
+
+    with pytest.raises(RuntimeError):
+        plugin.WebSocket(4321)
+    assert waits and all(wait >= 10 for wait in waits)
+
+
+# If Stream Deck hangs up halfway through the hello, the plugin stops
+# instead of looping on empty reads forever.
+def test_websocket_handshake_stops_when_stream_deck_hangs_up(monkeypatch):
+    sock = FakeSocket([b"HTTP/1.1 101 Switch"])
+    monkeypatch.setattr(plugin.socket, "create_connection", lambda *args, **kwargs: sock)
+
+    with pytest.raises(EOFError):
+        plugin.WebSocket(4321)
 
 
 def test_websocket_handshake_rejects_invalid_response(monkeypatch):
@@ -964,7 +996,9 @@ def test_reconnect_rejects_connected_status_older_than_request(monkeypatch):
         for message in websocket.messages
         if message.get("event") == "setFeedback"
     ]
-    assert reconnect_titles.count("RECONNECTING…") >= 2
+    # Still waiting at the end. The same screen isn't sent twice anymore,
+    # so the last one sent is what's showing.
+    assert reconnect_titles[-1] == "RECONNECTING…"
     assert "CONNECTED" not in reconnect_titles
 
 
@@ -1005,7 +1039,7 @@ def test_reconnect_ignores_fresh_status_without_a_real_connection_flag(monkeypat
         if message.get("event") == "setFeedback"
     ]
     assert "CONNECTED" not in titles
-    assert titles.count("RECONNECTING…") >= 2
+    assert titles[-1] == "RECONNECTING…"
 
 
 def test_reconnect_accepts_fresh_connected_status(monkeypatch):
@@ -1536,8 +1570,9 @@ def test_rotation_the_app_never_applies_says_not_applied_before_it_reverts(monke
 
     websocket = run_timed_main(monkeypatch, ROTATE_TO_130)
 
-    assert not_applied_titles(websocket) == ["NOT APPLIED", "NOT APPLIED"]
-    assert setfeedback_values(websocket) == ["120°", "130°", "130°", "TRY AGAIN", "TRY AGAIN", "120°"]
+    # Each screen is sent once: an unchanged strip isn't sent again.
+    assert not_applied_titles(websocket) == ["NOT APPLIED"]
+    assert setfeedback_values(websocket) == ["120°", "130°", "TRY AGAIN", "120°"]
 
 
 def test_rotation_the_app_applies_in_time_never_says_not_applied(monkeypatch):
@@ -1590,7 +1625,8 @@ def test_turning_the_dial_again_clears_the_not_applied_message(monkeypatch):
 
     assert not_applied_titles(websocket) == ["NOT APPLIED"]
     # The dial had gone back to the real 120, so the new turn starts there.
-    assert setfeedback_values(websocket)[-2:] == ["130°", "130°"]
+    assert setfeedback_values(websocket)[-1] == "130°"
+    assert "120°" in setfeedback_values(websocket)[:-1]
 
 
 @pytest.fixture
@@ -2140,3 +2176,179 @@ def test_page_dials_show_their_title_and_keys_do_not():
 
     assert dials and all(dial["States"][0]["ShowTitle"] is True for dial in dials.values())
     assert all(key["States"][0]["ShowTitle"] is False for key in keys.values())
+
+
+# ---- Push-and-turn on the dial ----
+
+# A plain turn moves between presets, even from a degree in between, and
+# a push-and-turn moves one degree per click. Neither leaves 120 to 145,
+# and from off the first click comes in at the near end of the range.
+@pytest.mark.parametrize(
+    ("current", "ticks", "fine", "expected"),
+    [
+        (130, 1, False, 140),
+        (137, 1, False, 140),
+        (137, -1, False, 130),
+        (137, 2, False, 145),
+        (145, 3, False, 145),
+        (0, 1, False, 120),
+        (0, 2, False, 130),
+        (0, -1, False, 145),
+        (140, 1, True, 141),
+        (140, -3, True, 137),
+        (144, 5, True, 145),
+        (121, -5, True, 120),
+        (0, 1, True, 120),
+        (0, 3, True, 122),
+        (0, -1, True, 145),
+        (None, 1, False, 120),
+    ],
+)
+def test_turned_to(current, ticks, fine, expected):
+    assert plugin.turned_to(current, ticks, fine) == expected
+
+
+def push_and_turn(monkeypatch, starting, events, press_times):
+    plugin.selected = starting
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: mug(starting))
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    reconnect = Mock()
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+    run_main_until_events_end(monkeypatch, [{"event": "willAppear", "context": "dial-1"}, *events], monotonic_values=press_times)
+    return set_temp, reconnect
+
+
+# Turning while held steps one degree per click, and letting go after
+# isn't a press: before, it turned heating off right after I'd set a temp.
+def test_push_and_turn_steps_one_degree_and_letting_go_is_not_a_press(monkeypatch):
+    set_temp, reconnect = push_and_turn(
+        monkeypatch,
+        140,
+        [
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 2, "pressed": True}},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        press_times=[10.0, 10.4],
+    )
+
+    assert [call.args[0] for call in set_temp.call_args_list] == [142]
+    assert plugin.selected == 142
+    reconnect.assert_not_called()
+
+
+# A slow push-and-turn can easily pass 1.5 seconds. Letting go mustn't
+# start a reconnect.
+def test_long_push_and_turn_does_not_reconnect(monkeypatch):
+    set_temp, reconnect = push_and_turn(
+        monkeypatch,
+        130,
+        [
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": -1, "pressed": True}},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        press_times=[10.0, 13.0],
+    )
+
+    set_temp.assert_called_once_with(129)
+    reconnect.assert_not_called()
+
+
+# A plain turn after a push-and-turn picks up from the in-between degree
+# and goes to the next preset, instead of crashing on a temp that isn't
+# in the preset list.
+def test_plain_turn_from_an_in_between_degree_goes_to_the_next_preset(monkeypatch):
+    set_temp, _ = push_and_turn(
+        monkeypatch,
+        137,
+        [{"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1, "pressed": False}}],
+        press_times=[],
+    )
+
+    set_temp.assert_called_once_with(140)
+
+
+# ---- Not flooding the deck ----
+
+# Stream Deck takes about ten pictures a second for the whole plugin. A
+# fast spin of 20 clicks in a second used to send 20 strips plus key
+# pictures on every click. Now the dial draws at most ten a second, ends
+# on the newest number, and the keys sit the spin out. Every click still
+# reaches the mug.
+def test_fast_spin_stays_inside_the_decks_picture_budget(monkeypatch):
+    plugin.selected = 120
+    monkeypatch.setattr(plugin, "status", lambda: mug(plugin.selected or 0, current=plugin.selected or 0))
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    sent = []
+    monkeypatch.setattr(plugin, "set_temp", sent.append)
+    clicks = [(1.0 + i * 0.05, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1, "pressed": True}}) for i in range(20)]
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (0.0, {"event": "willAppear", "action": plugin.POWER, "context": "key-1", "payload": {}}),
+            *clicks,
+            (2.2, plugin.socket.timeout()),
+        ],
+    )
+
+    # Everything after the first click: the plugin's hello and the two
+    # first pictures come before it.
+    first_click = next(i for i, m in enumerate(websocket.messages) if m.get("event") == "setFeedback" and m["payload"].get("value", {}).get("value") == "121°")
+    during = [m for m in websocket.messages[first_click:] if m.get("event") in ("setFeedback", "setImage")]
+    strips = [m for m in during if m["event"] == "setFeedback"]
+    assert len(sent) == 20 and sent[-1] == 140
+    assert len(strips) <= 11
+    assert strips[-1]["payload"]["value"]["value"] == "140°"
+    assert not any(m["event"] == "setImage" for m in during)
+
+
+# The keys catch up once when the dial stops, so they never stay behind.
+def test_keys_catch_up_once_the_spin_stops(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "status", lambda: mug(plugin.selected or 0, current=plugin.selected or 0))
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (0.0, {"event": "willAppear", "action": plugin.TEMP, "context": "key-1", "payload": {"settings": {"temp": "130"}}}),
+            (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": -2}}),
+            (2.6, plugin.socket.timeout()),
+        ],
+    )
+
+    drawn = pictures(websocket, "key-1")
+    assert len(drawn) == 2
+    assert plugin.PINK not in drawn[0] and plugin.PINK in drawn[1]
+
+
+# The two second refresh doesn't resend a strip that hasn't changed, but a
+# dial coming back on screen always gets one, because it starts blank.
+def test_unchanged_strip_is_not_resent_until_the_dial_comes_back(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "status", lambda: mug(140, current=140))
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (2.5, plugin.socket.timeout()),
+            (5.0, plugin.socket.timeout()),
+            (7.5, plugin.socket.timeout()),
+            (8.0, {"event": "willDisappear", "context": "dial-1"}),
+            (9.0, {"event": "willAppear", "context": "dial-1"}),
+        ],
+    )
+
+    strips = [m for m in websocket.messages if m.get("event") == "setFeedback"]
+    assert len(strips) == 2
+    assert strips[0]["payload"] == strips[1]["payload"]

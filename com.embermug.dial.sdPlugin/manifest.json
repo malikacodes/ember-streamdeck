@@ -9,7 +9,7 @@
       "Encoder": {
         "layout": "layouts/temperature.json",
         "TriggerDescription": {
-          "Rotate": "Set temperature",
+          "Rotate": "Set temperature · Push and turn: 1°",
           "Push": "On/off · Hold: reconnect"
         }
       },
