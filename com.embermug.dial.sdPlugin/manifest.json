@@ -9,23 +9,65 @@
       "Encoder": {
         "layout": "layouts/temperature.json",
         "TriggerDescription": {
-          "Rotate": "Set temperature",
+          "Rotate": "Set temperature · Push and turn: 1°",
           "Push": "On/off · Hold: reconnect"
         }
       },
       "States": [{ "Image": "imgs/ember" }]
+    },
+    {
+      "UUID": "com.embermug.dial.power",
+      "Name": "Ember On/Off",
+      "Icon": "imgs/power",
+      "Tooltip": "Shows the mug's temp. Press to turn heating on or off.",
+      "Controllers": ["Keypad"],
+      "UserTitleEnabled": false,
+      "States": [{ "Image": "imgs/key" }]
+    },
+    {
+      "UUID": "com.embermug.dial.temp",
+      "Name": "Ember Set Temp",
+      "Icon": "imgs/temp",
+      "Tooltip": "Press to set the mug to the temp picked in its settings.",
+      "Controllers": ["Keypad"],
+      "PropertyInspectorPath": "ui/temp.html",
+      "UserTitleEnabled": false,
+      "States": [{ "Image": "imgs/key" }]
+    },
+    {
+      "UUID": "com.embermug.dial.open",
+      "Name": "Ember Page",
+      "Icon": "imgs/page",
+      "Tooltip": "Shows the mug's temp. Press to open the Ember page on this deck (XL or +).",
+      "Controllers": ["Keypad"],
+      "UserTitleEnabled": false,
+      "States": [{ "Image": "imgs/key" }]
     }
   ],
   "Author": "malikacodes",
   "Category": "Ember Mug",
   "CategoryIcon": "imgs/category-icon",
   "CodePath": "plugin.py",
-  "Description": "Control an Ember Mug from a Stream Deck dial.",
+  "Description": "Control an Ember Mug from a Stream Deck dial or keys.",
   "Icon": "imgs/plugin-icon",
   "Name": "Ember Mug",
   "OS": [{ "Platform": "mac", "MinimumVersion": "12" }],
+  "Profiles": [
+    {
+      "Name": "profiles/ember-xl",
+      "DeviceType": 2,
+      "Readonly": false,
+      "DontAutoSwitchWhenInstalled": true
+    },
+    {
+      "Name": "profiles/ember-plus",
+      "DeviceType": 7,
+      "Readonly": false,
+      "DontAutoSwitchWhenInstalled": true
+    }
+  ],
   "SDKVersion": 2,
   "Software": { "MinimumVersion": "6.5" },
   "UUID": "com.embermug.dial",
-  "Version": "1.1.0.0"
+  "Version": "1.2.0.0"
 }

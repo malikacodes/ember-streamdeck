@@ -58,10 +58,16 @@ class FeedbackSocket:
 def reset_plugin_state():
     plugin.selected = None
     plugin.last_action = 0.0
+    plugin.strips_shown.clear()
 
 
 def load_manifest():
     return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def dial_actions():
+    # Only the dial has a strip layout. The keys draw whole pictures.
+    return [action for action in load_manifest()["Actions"] if "Encoder" in action]
 
 
 def resolve_extensionless_asset(relative_path):
@@ -87,7 +93,10 @@ def test_manifest_references_files_that_exist():
     assert resolve_extensionless_asset(manifest["Icon"])
     for action in manifest["Actions"]:
         assert resolve_extensionless_asset(action["Icon"])
-        assert (PLUGIN_ROOT / action["Encoder"]["layout"]).is_file()
+        if "Encoder" in action:
+            assert (PLUGIN_ROOT / action["Encoder"]["layout"]).is_file()
+        if "PropertyInspectorPath" in action:
+            assert (PLUGIN_ROOT / action["PropertyInspectorPath"]).is_file()
         for state in action["States"]:
             assert resolve_extensionless_asset(state["Image"])
 
@@ -150,8 +159,7 @@ def test_presets_are_unique_sorted_and_inside_ember_range():
 
 
 def test_layout_keys_are_unique_and_items_stay_inside_dial_canvas():
-    manifest = load_manifest()
-    for action in manifest["Actions"]:
+    for action in dial_actions():
         layout_path = PLUGIN_ROOT / action["Encoder"]["layout"]
         layout = json.loads(layout_path.read_text(encoding="utf-8"))
         items = layout["items"]
@@ -166,8 +174,7 @@ def test_layout_keys_are_unique_and_items_stay_inside_dial_canvas():
 
 
 def test_layout_items_do_not_overlap_on_the_same_visual_layer():
-    manifest = load_manifest()
-    for action in manifest["Actions"]:
+    for action in dial_actions():
         layout_path = PLUGIN_ROOT / action["Encoder"]["layout"]
         items = json.loads(layout_path.read_text(encoding="utf-8"))["items"]
         for index, first in enumerate(items):
@@ -458,28 +465,6 @@ def test_feedback_replaces_transitional_no_control_state(
     assert ws.messages[-1]["payload"]["title"] == f"{expected_state} · 100%"
 
 
-def test_feedback_gives_off_mode_its_own_connected_title(monkeypatch):
-    ws = FeedbackSocket()
-    monkeypatch.setattr(
-        plugin,
-        "status",
-        lambda: {
-            "connected": True,
-            "battery_percent": 80,
-            "liquid_state_label": "Warm (No Control)",
-            "current_f": 116,
-            "updated_ts": plugin.time.time(),
-        },
-    )
-
-    plugin.feedback(ws, "dial-1", override=0)
-
-    payload = ws.messages[-1]["payload"]
-    assert payload["title"] == "CONNECTED · 80%"
-    assert payload["value"]["value"] == "OFF"
-    assert payload["trend"]["enabled"] is False
-
-
 def test_feedback_builds_offline_payload(monkeypatch):
     ws = FeedbackSocket()
     monkeypatch.setattr(plugin, "status", lambda: {"connected": False})
@@ -491,17 +476,19 @@ def test_feedback_builds_offline_payload(monkeypatch):
     assert payload["value"]["value"] == "145°"
 
 
-# Offline with heating off used to say OFFLINE over OFF. That pair is the one
-# case that shows the sleeping mug, with every text field switched off.
+# Off is off: heating off shows the sleeping mug whether the mug is
+# connected or not, so I never watch the drink cool degree by degree.
+# Every text field is switched off underneath it.
 @pytest.mark.parametrize(
     "state",
     [
         {},
         {"connected": False, "battery_percent": 90, "current_f": 130},
         {"connected": True, "updated_ts": 699.0, "battery_percent": 90},
+        {"connected": True, "updated_ts": 1_000.0, "battery_percent": 80, "liquid_state_label": "Warm (No Control)", "current_f": 116},
     ],
 )
-def test_feedback_shows_sleeping_mug_when_offline_and_heating_is_off(monkeypatch, state):
+def test_feedback_shows_sleeping_mug_whenever_heating_is_off(monkeypatch, state):
     ws = FeedbackSocket()
     monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(plugin, "status", lambda: state)
@@ -514,24 +501,16 @@ def test_feedback_shows_sleeping_mug_when_offline_and_heating_is_off(monkeypatch
     assert all(payload[key]["enabled"] is False for key in ("value", "current", "trend", "target"))
 
 
-# Only one "off" is not enough for the mug: a connected mug with heating off
-# keeps its battery line, and an offline mug with a target keeps its number.
-@pytest.mark.parametrize(
-    ("state", "target", "expected_title"),
-    [
-        ({"connected": True, "updated_ts": 1_000.0, "battery_percent": 78}, 0, "CONNECTED · 78%"),
-        ({"connected": False}, 145, "OFFLINE"),
-    ],
-)
-def test_feedback_keeps_text_when_only_one_thing_is_off(monkeypatch, state, target, expected_title):
+# Offline isn't off: an offline mug that's still set to a temp keeps its
+# number, because heating comes back on by itself when it reconnects.
+def test_feedback_keeps_the_target_when_offline_but_heating_is_on(monkeypatch):
     ws = FeedbackSocket()
-    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
-    monkeypatch.setattr(plugin, "status", lambda: state)
+    monkeypatch.setattr(plugin, "status", lambda: {"connected": False})
 
-    plugin.feedback(ws, "dial-1", override=target)
+    plugin.feedback(ws, "dial-1", override=145)
 
     payload = ws.messages[-1]["payload"]
-    assert payload["title"] == expected_title
+    assert payload["title"] == "OFFLINE"
     assert payload["value"]["enabled"] is True
     assert payload["mug"] == {"enabled": False}
 
@@ -652,11 +631,14 @@ def test_send_temp_command_reports_filesystem_failure_without_crashing(monkeypat
     assert payload["value"]["value"] == "TRY AGAIN"
 
 
+# The dial keeps the mug's own target to the whole degree. Snapping 137°
+# to 140° would make a push-and-turn look "not applied" when it worked.
+# Celsius round trips land a hair off (144.996°), so it rounds.
 @pytest.mark.parametrize(
     ("actual", "expected"),
-    [(0, 0), (119, 120), (126, 130), (138, 140), (144, 145)],
+    [(0, 0), (126, 126), (137, 137), (144.996, 145), (120.2, 120)],
 )
-def test_sync_selection_chooses_nearest_preset(monkeypatch, actual, expected):
+def test_sync_selection_keeps_the_mugs_own_degree(monkeypatch, actual, expected):
     monkeypatch.setattr(plugin, "target_f", lambda state=None: actual)
 
     plugin.sync_selection()
@@ -785,6 +767,34 @@ def test_websocket_handshake_connects_and_sets_short_timeout(monkeypatch):
     assert b"GET / HTTP/1.1" in sock.sent[0]
 
 
+# Stream Deck can take about five seconds to answer after a restart, so
+# the handshake has to wait longer than that or the plugin crashes.
+def test_websocket_handshake_waits_longer_than_stream_decks_slow_start(monkeypatch):
+    waits = []
+
+    class SlowStart(FakeSocket):
+        def recv(self, count):
+            waits.append(self.timeout)
+            return super().recv(count)
+
+    sock = SlowStart([b"HTTP/1.1 403 Forbidden\r\n\r\n"])
+    monkeypatch.setattr(plugin.socket, "create_connection", lambda *args, **kwargs: sock)
+
+    with pytest.raises(RuntimeError):
+        plugin.WebSocket(4321)
+    assert waits and all(wait >= 10 for wait in waits)
+
+
+# If Stream Deck hangs up halfway through the hello, the plugin stops
+# instead of looping on empty reads forever.
+def test_websocket_handshake_stops_when_stream_deck_hangs_up(monkeypatch):
+    sock = FakeSocket([b"HTTP/1.1 101 Switch"])
+    monkeypatch.setattr(plugin.socket, "create_connection", lambda *args, **kwargs: sock)
+
+    with pytest.raises(EOFError):
+        plugin.WebSocket(4321)
+
+
 def test_websocket_handshake_rejects_invalid_response(monkeypatch):
     sock = FakeSocket([b"HTTP/1.1 403 Forbidden\r\n\r\n"])
     monkeypatch.setattr(plugin.socket, "create_connection", lambda *args, **kwargs: sock)
@@ -842,11 +852,11 @@ class TimedWebSocket(FeedbackSocket):
         return result
 
 
-def run_main_until_events_end(monkeypatch, events, monotonic_values=()):
+def run_main_until_events_end(monkeypatch, events, monotonic_values=(), info="{}"):
     steady_clock = Clock(1.0)
     websocket = ScriptedWebSocket(events, steady_clock, monotonic_values)
     monkeypatch.setattr(plugin, "WebSocket", lambda port: websocket)
-    arguments = {"-port": "1234", "-pluginUUID": "plugin-id", "-registerEvent": "registerPlugin"}
+    arguments = {"-port": "1234", "-pluginUUID": "plugin-id", "-registerEvent": "registerPlugin", "-info": info}
     monkeypatch.setattr(plugin, "arg", arguments.__getitem__)
     monkeypatch.setattr(plugin.time, "time", lambda: 1.0)
     monkeypatch.setattr(plugin.time, "monotonic", steady_clock)
@@ -860,7 +870,7 @@ def run_timed_main(monkeypatch, timeline, clock=None):
     steady_clock = Clock()
     websocket = TimedWebSocket(wall_clock, steady_clock, timeline)
     monkeypatch.setattr(plugin, "WebSocket", lambda port: websocket)
-    arguments = {"-port": "1234", "-pluginUUID": "plugin-id", "-registerEvent": "registerPlugin"}
+    arguments = {"-port": "1234", "-pluginUUID": "plugin-id", "-registerEvent": "registerPlugin", "-info": "{}"}
     monkeypatch.setattr(plugin, "arg", arguments.__getitem__)
     monkeypatch.setattr(plugin.time, "time", wall_clock)
     monkeypatch.setattr(plugin.time, "monotonic", steady_clock)
@@ -986,7 +996,9 @@ def test_reconnect_rejects_connected_status_older_than_request(monkeypatch):
         for message in websocket.messages
         if message.get("event") == "setFeedback"
     ]
-    assert reconnect_titles.count("RECONNECTING…") >= 2
+    # Still waiting at the end. The same screen isn't sent twice anymore,
+    # so the last one sent is what's showing.
+    assert reconnect_titles[-1] == "RECONNECTING…"
     assert "CONNECTED" not in reconnect_titles
 
 
@@ -1027,7 +1039,7 @@ def test_reconnect_ignores_fresh_status_without_a_real_connection_flag(monkeypat
         if message.get("event") == "setFeedback"
     ]
     assert "CONNECTED" not in titles
-    assert titles.count("RECONNECTING…") >= 2
+    assert titles[-1] == "RECONNECTING…"
 
 
 def test_reconnect_accepts_fresh_connected_status(monkeypatch):
@@ -1558,8 +1570,9 @@ def test_rotation_the_app_never_applies_says_not_applied_before_it_reverts(monke
 
     websocket = run_timed_main(monkeypatch, ROTATE_TO_130)
 
-    assert not_applied_titles(websocket) == ["NOT APPLIED", "NOT APPLIED"]
-    assert setfeedback_values(websocket) == ["120°", "130°", "130°", "TRY AGAIN", "TRY AGAIN", "120°"]
+    # Each screen is sent once: an unchanged strip isn't sent again.
+    assert not_applied_titles(websocket) == ["NOT APPLIED"]
+    assert setfeedback_values(websocket) == ["120°", "130°", "TRY AGAIN", "120°"]
 
 
 def test_rotation_the_app_applies_in_time_never_says_not_applied(monkeypatch):
@@ -1612,7 +1625,8 @@ def test_turning_the_dial_again_clears_the_not_applied_message(monkeypatch):
 
     assert not_applied_titles(websocket) == ["NOT APPLIED"]
     # The dial had gone back to the real 120, so the new turn starts there.
-    assert setfeedback_values(websocket)[-2:] == ["130°", "130°"]
+    assert setfeedback_values(websocket)[-1] == "130°"
+    assert "120°" in setfeedback_values(websocket)[:-1]
 
 
 @pytest.fixture
@@ -1838,3 +1852,503 @@ def test_short_messages_reach_every_dial_on_screen(monkeypatch):
 
     warned = [m["context"] for m in websocket.messages if m.get("payload", {}).get("title") == "NOT APPLIED"]
     assert sorted(warned) == ["dial-1", "dial-2"]
+
+
+# ---- Keys: On/Off, Set Temp and the Ember Page key ----
+
+def mug(target, current=130, connected=True):
+    return {"connected": connected, "updated_ts": plugin.time.time(), "target_f": target, "current_f": current}
+
+
+def key_down(context, action, settings=None, device="plus-1"):
+    return [
+        {"event": "willAppear", "action": action, "context": context, "device": device, "payload": {"settings": settings or {}}},
+        {"event": "keyDown", "action": action, "context": context, "device": device, "payload": {"settings": settings or {}}},
+    ]
+
+
+def pictures(websocket, context):
+    images = [m["payload"]["image"] for m in websocket.messages if m.get("event") == "setImage" and m["context"] == context]
+    return [base64.b64decode(image.split(",", 1)[1]).decode() for image in images]
+
+
+# The deck is pure black, so every key picture has to be #000000 behind
+# everything, in every state, or it shows up as a gray square.
+@pytest.mark.parametrize("action", plugin.KEY_ACTIONS)
+@pytest.mark.parametrize("state", [mug(145), mug(0), mug(145, connected=False), {}])
+def test_every_key_picture_sits_on_pure_black(action, state):
+    svg = plugin.key_picture(action, {}, state, state.get("target_f"))
+
+    assert '<rect width="144" height="144" fill="#000000"/>' in svg
+
+
+# The settings page sends the temp as text, or nothing on a brand new key.
+# Anything that isn't one of the dial's four has to fall back to 145, so a
+# key can never send the mug a temp the dial can't show.
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [({"temp": "120"}, 120), ({"temp": "140"}, 140), ({}, 145), ({"temp": "135"}, 145), ({"temp": "warm"}, 145), (None, 145)],
+)
+def test_set_temp_key_reads_its_temp_with_a_fallback(settings, expected):
+    assert plugin.key_temp(settings) == expected
+
+
+# Pink on a Set Temp key means "the mug is set to me". Only one of the
+# four on the XL page should be pink, and none while heating is off.
+def test_set_temp_key_is_pink_only_when_it_is_the_target():
+    assert plugin.PINK in plugin.key_picture(plugin.TEMP, {"temp": "140"}, mug(140), 140)
+    assert plugin.PINK not in plugin.key_picture(plugin.TEMP, {"temp": "130"}, mug(140), 140)
+    assert plugin.PINK not in plugin.key_picture(plugin.TEMP, {"temp": "145"}, mug(0), 0)
+    offline = plugin.key_picture(plugin.TEMP, {"temp": "140"}, mug(140, connected=False), 140)
+    assert "Offline" in offline and plugin.PINK not in offline
+
+
+# On/Off shows the drink's temp in pink while heating. Off is off: the
+# sleeping mug, connected or not, and never the drink cooling down.
+def test_on_off_key_shows_the_temp_while_heating_and_the_mug_when_off():
+    on = plugin.key_picture(plugin.POWER, {}, mug(145, current=145), 145)
+
+    assert ">On<" in on and ">145°<" in on and plugin.PINK in on
+    for state in (mug(0, current=118), mug(0, current=118, connected=False), {}):
+        for action in (plugin.POWER, plugin.OPEN):
+            off = plugin.key_picture(action, {}, state, 0)
+            assert off == plugin.SLEEPING_KEY
+            assert "118" not in off
+
+
+# The key's sleeping mug is the dial's drawing sized for a key, on pure black.
+def test_sleeping_mug_key_is_the_dials_mug_on_pure_black():
+    dial = (PLUGIN_ROOT / plugin.SLEEPING_MUG).read_text(encoding="utf-8")
+
+    assert '<rect width="144" height="144" fill="#000000"/>' in plugin.SLEEPING_KEY
+    for line in dial.splitlines():
+        if line.strip().startswith("<path"):
+            assert line in plugin.SLEEPING_KEY
+
+
+# A press on a Set Temp key sends the mug that key's temp, and the dial
+# on screen follows, since the dial and the keys share one choice.
+def test_set_temp_key_press_sets_the_mug_and_the_dial_follows(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: mug(145))
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    feedback = Mock()
+    monkeypatch.setattr(plugin, "feedback", feedback)
+
+    run_main_until_events_end(
+        monkeypatch,
+        [{"event": "willAppear", "context": "dial-1"}, *key_down("key-1", plugin.TEMP, {"temp": "130"})],
+    )
+
+    set_temp.assert_called_once_with(130)
+    assert plugin.selected == 130
+    assert feedback.call_args.args[:3] == (feedback.call_args.args[0], "dial-1", 130)
+
+
+# On/Off works like a push of the dial: off from any temp, back on at 145.
+@pytest.mark.parametrize(("starting", "expected"), [(140, 0), (0, 145)])
+def test_on_off_key_toggles_like_the_dial_push(monkeypatch, starting, expected):
+    plugin.selected = starting
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: mug(starting))
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+
+    websocket = run_main_until_events_end(monkeypatch, key_down("key-1", plugin.POWER))
+
+    set_temp.assert_called_once_with(expected)
+    last = pictures(websocket, "key-1")[-1]
+    assert (">▲<" in last) if expected else (last == plugin.SLEEPING_KEY)
+
+
+# While the drink is getting to its temp, the label on On/Off and Ember
+# Page is the dial's arrow in the dial's colors: red up when warming, blue
+# down when cooling. Within a degree of the target the word comes back.
+@pytest.mark.parametrize(
+    ("action", "current", "label", "color"),
+    [
+        (plugin.POWER, 130, "▲", plugin.WARMING),
+        (plugin.POWER, 150, "▼", plugin.COOLING),
+        (plugin.POWER, 139.6, "On", plugin.DIM),
+        (plugin.OPEN, 130, "▲", plugin.WARMING),
+        (plugin.OPEN, 150, "▼", plugin.COOLING),
+        (plugin.OPEN, 140, "Ember", plugin.DIM),
+    ],
+)
+def test_label_is_the_arrow_until_the_drink_gets_there(action, current, label, color):
+    svg = plugin.key_picture(action, {}, mug(140, current=current), 140)
+
+    assert f'fill="{color}" font-size="20" font-weight="600" text-anchor="middle">{label}<' in svg
+    assert plugin.PINK in svg
+
+
+# A Set Temp press always gets an answer: "Sent" straight away, and the
+# plain pink key once status.json shows the mug took the temp.
+def test_set_temp_key_says_sent_until_the_mug_takes_it(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    sent = []
+    monkeypatch.setattr(plugin, "set_temp", sent.append)
+    # The Ember app reads command.json a moment after it's written, so the
+    # mug only reports the new temp from the one second mark on.
+    monkeypatch.setattr(plugin, "status", lambda: mug(sent[-1] if sent and plugin.time.monotonic() >= 1.0 else 145))
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "action": plugin.TEMP, "context": "key-1", "payload": {"settings": {"temp": "130"}}}),
+            (0.5, {"event": "keyDown", "action": plugin.TEMP, "context": "key-1", "payload": {"settings": {"temp": "130"}}}),
+            (1.0, plugin.socket.timeout()),
+            (2.6, plugin.socket.timeout()),
+        ],
+    )
+
+    labels = [re.search(r'font-size="20"[^>]*>([^<]*)<', svg).group(1) for svg in pictures(websocket, "key-1")]
+    assert labels == ["Temp", "Sent", "Temp"]
+    assert plugin.PINK in pictures(websocket, "key-1")[-1]
+
+
+# If the mug never takes it (offline, or the app dropped command.json),
+# "Sent" turns into "Not applied" when the dial gives up, then clears.
+def test_set_temp_key_says_not_applied_when_the_mug_never_takes_it(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "status", lambda: mug(145))
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "action": plugin.TEMP, "context": "key-1", "payload": {"settings": {"temp": "130"}}}),
+            (1.0, {"event": "keyDown", "action": plugin.TEMP, "context": "key-1", "payload": {"settings": {"temp": "130"}}}),
+            (4.5, plugin.socket.timeout()),
+            (8.0, plugin.socket.timeout()),
+        ],
+    )
+
+    labels = [re.search(r'font-size="20"[^>]*>([^<]*)<', svg).group(1) for svg in pictures(websocket, "key-1")]
+    assert labels == ["Temp", "Sent", "Not applied", "Temp"]
+
+
+# If command.json can't be written, a key gets Stream Deck's alert
+# triangle and the plugin keeps running, instead of a key that looks
+# like it worked.
+def test_key_press_that_cannot_write_the_command_shows_an_alert(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: mug(145))
+    monkeypatch.setattr(plugin, "set_temp", Mock(side_effect=PermissionError("blocked")))
+
+    websocket = run_main_until_events_end(monkeypatch, key_down("key-1", plugin.TEMP, {"temp": "120"}))
+
+    assert {"event": "showAlert", "context": "key-1"} in websocket.messages
+    assert plugin.selected == 145
+
+
+# The Ember Page key opens the page made for the deck it's on: the XL
+# page on my XL, the + page on my +. Any other deck has no page that
+# fits, so it gets the alert triangle.
+@pytest.mark.parametrize(("deck_type", "page"), [(2, "profiles/ember-xl"), (7, "profiles/ember-plus"), (0, None)])
+def test_ember_page_key_opens_the_page_for_its_deck(monkeypatch, deck_type, page):
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: mug(145))
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    info = json.dumps({"devices": [{"id": "deck-1", "type": deck_type}]})
+
+    websocket = run_main_until_events_end(monkeypatch, key_down("key-1", plugin.OPEN, device="deck-1"), info=info)
+
+    switches = [m for m in websocket.messages if m.get("event") == "switchToProfile"]
+    if page:
+        assert switches == [{"event": "switchToProfile", "context": "plugin-id", "device": "deck-1", "payload": {"profile": page}}]
+    else:
+        assert switches == [] and {"event": "showAlert", "context": "key-1"} in websocket.messages
+    set_temp.assert_not_called()
+
+
+# An XL plugged in after Stream Deck started still counts as an XL.
+def test_ember_page_key_knows_a_deck_plugged_in_later(monkeypatch):
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: mug(145))
+
+    websocket = run_main_until_events_end(
+        monkeypatch,
+        [{"event": "deviceDidConnect", "device": "xl-1", "deviceInfo": {"type": 2}}, *key_down("key-1", plugin.OPEN, device="xl-1")],
+    )
+
+    assert any(m.get("event") == "switchToProfile" for m in websocket.messages)
+
+
+# Picking a new temp on the settings page shows on the key straight away,
+# not on the next refresh.
+def test_new_temp_from_the_settings_page_redraws_the_key(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: mug(145))
+
+    websocket = run_main_until_events_end(
+        monkeypatch,
+        [
+            {"event": "willAppear", "action": plugin.TEMP, "context": "key-1", "payload": {"settings": {"temp": "145"}}},
+            {"event": "didReceiveSettings", "action": plugin.TEMP, "context": "key-1", "payload": {"settings": {"temp": "120"}}},
+        ],
+    )
+
+    drawn = pictures(websocket, "key-1")
+    assert ">145°<" in drawn[0] and ">120°<" in drawn[-1]
+
+
+# Keys redraw on the two second refresh, but the same picture is never
+# sent twice: the deck slows down when it's flooded with pictures.
+def test_keys_only_get_a_picture_when_it_changes(monkeypatch):
+    plugin.selected = 145
+    readings = iter([mug(145, current=130)] * 3 + [mug(145, current=131)] * 10)
+    monkeypatch.setattr(plugin, "status", lambda: next(readings))
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "action": plugin.POWER, "context": "key-1", "payload": {}}),
+            (2.5, plugin.socket.timeout()),
+            (5.0, plugin.socket.timeout()),
+            (7.5, plugin.socket.timeout()),
+        ],
+    )
+
+    drawn = pictures(websocket, "key-1")
+    assert len(drawn) == 2
+    assert ">130°<" in drawn[0] and ">131°<" in drawn[1]
+
+
+# ---- The bundled Ember pages ----
+
+SPEC_PROFILES = importlib.util.spec_from_file_location("ember_profiles", Path(__file__).parents[1] / "scripts" / "profiles.py")
+profiles = importlib.util.module_from_spec(SPEC_PROFILES)
+SPEC_PROFILES.loader.exec_module(profiles)
+
+
+def built_page(name):
+    files = profiles.profile_files(name, load_manifest(), "home-id")
+    page = next(content for content in files.values() if content.get("Controllers", [{}])[0].get("Actions"))
+    return page["Controllers"][0]["Actions"], page["Controllers"][1]["Actions"] or {}
+
+
+# The pages are written from the manifest, so a renamed action or a temp
+# the dial doesn't have would give me a page of blank keys. Home has to
+# sit where it is on my other pages: top left on the XL, top right on the +.
+@pytest.mark.parametrize(("name", "home"), [("ember-xl", "0,0"), ("ember-plus", "3,0")])
+def test_pages_use_real_actions_the_dial_temps_and_my_home_spot(name, home):
+    keys, dials = built_page(name)
+    manifest_uuids = {action["UUID"]: action["Controllers"] for action in load_manifest()["Actions"]}
+
+    assert keys[home]["UUID"] == profiles.SWITCH_PROFILE
+    assert keys[home]["Settings"]["ProfileUUID"] == "home-id"
+    plugin_keys = [key for key in keys.values() if key["UUID"] != profiles.SWITCH_PROFILE]
+    assert all(manifest_uuids[key["UUID"]] == ["Keypad"] for key in plugin_keys)
+    assert all(manifest_uuids[dial["UUID"]] == ["Encoder"] for dial in dials.values())
+    temps = [int(key["Settings"]["temp"]) for key in plugin_keys if key["UUID"] == plugin.TEMP]
+    assert temps == plugin.PRESETS
+
+
+# Every page the Ember Page key can open is in the manifest for the right
+# kind of deck, or Stream Deck has nothing to switch to.
+def test_every_page_the_key_opens_is_bundled_for_that_deck():
+    bundled = {profile["Name"]: profile["DeviceType"] for profile in load_manifest()["Profiles"]}
+
+    assert {page: kind for kind, page in plugin.PAGES.items()} == bundled
+    assert sorted(f"profiles/{name}" for name in profiles.PAGES) == sorted(bundled)
+
+
+# Same ids every build, so a rebuilt page replaces the old one instead of
+# arriving as a second "Ember XL".
+@pytest.mark.parametrize("name", ["ember-xl", "ember-plus"])
+def test_page_ids_are_the_same_every_build(name):
+    assert profiles.profile_files(name, load_manifest(), "home-id") == profiles.profile_files(name, load_manifest(), "home-id")
+
+
+# On a dial, ShowTitle false hides the strip's top line (the layout's
+# "title" item): the Ember + page's dial showed 135° with nothing above it.
+# Keys keep it off because they draw their own words.
+def test_page_dials_show_their_title_and_keys_do_not():
+    keys, dials = built_page("ember-plus")
+
+    assert dials and all(dial["States"][0]["ShowTitle"] is True for dial in dials.values())
+    assert all(key["States"][0]["ShowTitle"] is False for key in keys.values())
+
+
+# ---- Push-and-turn on the dial ----
+
+# A plain turn moves between presets, even from a degree in between, and
+# a push-and-turn moves one degree per click. Neither leaves 120 to 145,
+# and from off the first click comes in at the near end of the range.
+@pytest.mark.parametrize(
+    ("current", "ticks", "fine", "expected"),
+    [
+        (130, 1, False, 140),
+        (137, 1, False, 140),
+        (137, -1, False, 130),
+        (137, 2, False, 145),
+        (145, 3, False, 145),
+        (0, 1, False, 120),
+        (0, 2, False, 130),
+        (0, -1, False, 145),
+        (140, 1, True, 141),
+        (140, -3, True, 137),
+        (144, 5, True, 145),
+        (121, -5, True, 120),
+        (0, 1, True, 120),
+        (0, 3, True, 122),
+        (0, -1, True, 145),
+        (None, 1, False, 120),
+    ],
+)
+def test_turned_to(current, ticks, fine, expected):
+    assert plugin.turned_to(current, ticks, fine) == expected
+
+
+def push_and_turn(monkeypatch, starting, events, press_times):
+    plugin.selected = starting
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "status", lambda: mug(starting))
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    reconnect = Mock()
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    monkeypatch.setattr(plugin, "feedback", Mock())
+    run_main_until_events_end(monkeypatch, [{"event": "willAppear", "context": "dial-1"}, *events], monotonic_values=press_times)
+    return set_temp, reconnect
+
+
+# Turning while held steps one degree per click, and letting go after
+# isn't a press: before, it turned heating off right after I'd set a temp.
+def test_push_and_turn_steps_one_degree_and_letting_go_is_not_a_press(monkeypatch):
+    set_temp, reconnect = push_and_turn(
+        monkeypatch,
+        140,
+        [
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 2, "pressed": True}},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        press_times=[10.0, 10.4],
+    )
+
+    assert [call.args[0] for call in set_temp.call_args_list] == [142]
+    assert plugin.selected == 142
+    reconnect.assert_not_called()
+
+
+# A slow push-and-turn can easily pass 1.5 seconds. Letting go mustn't
+# start a reconnect.
+def test_long_push_and_turn_does_not_reconnect(monkeypatch):
+    set_temp, reconnect = push_and_turn(
+        monkeypatch,
+        130,
+        [
+            {"event": "dialDown", "context": "dial-1"},
+            {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": -1, "pressed": True}},
+            {"event": "dialUp", "context": "dial-1"},
+        ],
+        press_times=[10.0, 13.0],
+    )
+
+    set_temp.assert_called_once_with(129)
+    reconnect.assert_not_called()
+
+
+# A plain turn after a push-and-turn picks up from the in-between degree
+# and goes to the next preset, instead of crashing on a temp that isn't
+# in the preset list.
+def test_plain_turn_from_an_in_between_degree_goes_to_the_next_preset(monkeypatch):
+    set_temp, _ = push_and_turn(
+        monkeypatch,
+        137,
+        [{"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1, "pressed": False}}],
+        press_times=[],
+    )
+
+    set_temp.assert_called_once_with(140)
+
+
+# ---- Not flooding the deck ----
+
+# Stream Deck takes about ten pictures a second for the whole plugin. A
+# fast spin of 20 clicks in a second used to send 20 strips plus key
+# pictures on every click. Now the dial draws at most ten a second, ends
+# on the newest number, and the keys sit the spin out. Every click still
+# reaches the mug.
+def test_fast_spin_stays_inside_the_decks_picture_budget(monkeypatch):
+    plugin.selected = 120
+    monkeypatch.setattr(plugin, "status", lambda: mug(plugin.selected or 0, current=plugin.selected or 0))
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    sent = []
+    monkeypatch.setattr(plugin, "set_temp", sent.append)
+    clicks = [(1.0 + i * 0.05, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": 1, "pressed": True}}) for i in range(20)]
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (0.0, {"event": "willAppear", "action": plugin.POWER, "context": "key-1", "payload": {}}),
+            *clicks,
+            (2.2, plugin.socket.timeout()),
+        ],
+    )
+
+    # Everything after the first click: the plugin's hello and the two
+    # first pictures come before it.
+    first_click = next(i for i, m in enumerate(websocket.messages) if m.get("event") == "setFeedback" and m["payload"].get("value", {}).get("value") == "121°")
+    during = [m for m in websocket.messages[first_click:] if m.get("event") in ("setFeedback", "setImage")]
+    strips = [m for m in during if m["event"] == "setFeedback"]
+    assert len(sent) == 20 and sent[-1] == 140
+    assert len(strips) <= 11
+    assert strips[-1]["payload"]["value"]["value"] == "140°"
+    assert not any(m["event"] == "setImage" for m in during)
+
+
+# The keys catch up once when the dial stops, so they never stay behind.
+def test_keys_catch_up_once_the_spin_stops(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "status", lambda: mug(plugin.selected or 0, current=plugin.selected or 0))
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+    monkeypatch.setattr(plugin, "set_temp", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (0.0, {"event": "willAppear", "action": plugin.TEMP, "context": "key-1", "payload": {"settings": {"temp": "130"}}}),
+            (1.0, {"event": "dialRotate", "context": "dial-1", "payload": {"ticks": -2}}),
+            (2.6, plugin.socket.timeout()),
+        ],
+    )
+
+    drawn = pictures(websocket, "key-1")
+    assert len(drawn) == 2
+    assert plugin.PINK not in drawn[0] and plugin.PINK in drawn[1]
+
+
+# The two second refresh doesn't resend a strip that hasn't changed, but a
+# dial coming back on screen always gets one, because it starts blank.
+def test_unchanged_strip_is_not_resent_until_the_dial_comes_back(monkeypatch):
+    plugin.selected = 140
+    monkeypatch.setattr(plugin, "status", lambda: mug(140, current=140))
+    monkeypatch.setattr(plugin, "sync_selection", Mock())
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", "context": "dial-1"}),
+            (2.5, plugin.socket.timeout()),
+            (5.0, plugin.socket.timeout()),
+            (7.5, plugin.socket.timeout()),
+            (8.0, {"event": "willDisappear", "context": "dial-1"}),
+            (9.0, {"event": "willAppear", "context": "dial-1"}),
+        ],
+    )
+
+    strips = [m for m in websocket.messages if m.get("event") == "setFeedback"]
+    assert len(strips) == 2
+    assert strips[0]["payload"] == strips[1]["payload"]
