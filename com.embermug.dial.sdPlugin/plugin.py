@@ -26,10 +26,39 @@ STATUS_STALE_SECONDS = 300
 SUPPORT = Path.home() / "Library/Application Support/EmberMug"
 STATUS = SUPPORT / "status.json" # Mug data read from the Ember menu-bar app
 COMMAND = SUPPORT / "command.json" # Commands to control the Ember menu-bar app
-SLEEPING_MUG = "imgs/sleeping-mug.svg" # Shown when the mug is offline and heating is off
+SLEEPING_MUG = "imgs/sleeping-mug.svg" # Shown on the dial whenever heating is off
+# The same sleeping mug sized for a key. Keys get their pictures as text,
+# so this one is read in once instead of named by path.
+SLEEPING_KEY = (Path(__file__).parent / "imgs/sleeping-mug-key.svg").read_text(encoding="utf-8")
 LOG_FILE = Path.home() / "Library/Logs/EmberMug/plugin.log"
 EMBER_APP = Path.home() / "Applications/Ember Mug.app"
 log = logging.getLogger("embermug")
+
+# The four things I can put on the deck. The dial is the original. The
+# keys are for places a dial can't go: the Action Wheel (it only takes
+# key actions) and my XL, which has no dials at all.
+DIAL = "com.embermug.dial.temperature"
+POWER = "com.embermug.dial.power"
+TEMP = "com.embermug.dial.temp"
+OPEN = "com.embermug.dial.open"
+KEY_ACTIONS = (POWER, TEMP, OPEN)
+DEFAULT_TEMP = 145 # My favorite. On/Off turns heating back on here, same as the dial
+# The page the Ember Page key opens, by Stream Deck's number for the kind
+# of deck: 2 is the XL, 7 is the +. Both are bundled with the plugin.
+PAGES = {2: "profiles/ember-xl", 7: "profiles/ember-plus"}
+
+# My colors and type for keys, the same as my other plugins (the
+# Pomodoro key is the picture of it). Gray means off or offline, pink
+# means heating, or "this is the temp the mug is set to".
+BLACK = "#000000"
+WHITE = "#ffffff"
+PINK = "#f2a7c3"
+DIM = "#5c5c62"
+FONT = "-apple-system, Helvetica, sans-serif"
+# The arrow colors on the dial and the On/Off key: here the color is the
+# information, red heading up to a warmer target, blue cooling down.
+WARMING = "#FF5A5F"
+COOLING = "#3B9CFF"
 selected = None # Current dial preset; none until the plugin initializes
 last_action = 0.0  # Time of the most recent dial action
 
@@ -233,7 +262,7 @@ def temperature_display(state, target, target_only=False, show_check=False):
     warming = current < target
     fields["trend"] = {
         "value": "▲" if warming else "▼",
-        "color": "#FF5A5F" if warming else "#3B9CFF",
+        "color": WARMING if warming else COOLING,
         "enabled": True,
     }
     return fields
@@ -264,6 +293,11 @@ def feedback(ws, context, override=None, target_only=False, show_check=False, st
     state = status() if state is None else state
     connected = state.get("connected") is True and not status_is_stale(state)
     target = target_f(state) if override is None else override
+    if target < 1:
+        # Off is off. Connected or not, the dial shows one sleeping mug
+        # instead of a drink cooling down degree by degree.
+        ws.send({"event": "setFeedback", "context": context, "payload": sleeping_mug_display()})
+        return
     battery = finite_number(state.get("battery_percent"))
     if connected and battery is not None:
         charging = " ⚡" if state.get("charging") is True else ""
@@ -274,7 +308,7 @@ def feedback(ws, context, override=None, target_only=False, show_check=False, st
             # status update. The Bluetooth connection is already real, so use
             # the useful connection label until a meaningful state arrives.
             mug_state = "CONNECTED"
-        elif mug_state == "WARM (NO CONTROL)" and target >= 1:
+        elif mug_state == "WARM (NO CONTROL)":
             # Immediately after heating is enabled, the app can briefly keep
             # its previous no-control label. The temperatures already tell us
             # the useful direction while the app catches up.
@@ -287,14 +321,8 @@ def feedback(ws, context, override=None, target_only=False, show_check=False, st
                 mug_state = "COOLING"
             else:
                 mug_state = "PERFECT"
-        title_state = "CONNECTED" if target < 1 else mug_state
-        title = f"{title_state} · {round(float(battery))}%{charging}"
+        title = f"{mug_state} · {round(float(battery))}%{charging}"
         display = temperature_display(state, target, target_only, show_check)
-    elif not connected and target < 1:
-        # OFFLINE on top and OFF underneath says "off" twice. When both are
-        # true the dial shows one sleeping mug instead of two words.
-        ws.send({"event": "setFeedback", "context": context, "payload": sleeping_mug_display()})
-        return
     else:
         title = "CONNECTED" if connected else "OFFLINE"
         display = temperature_display(state, target) if connected else temperature_display({}, target)
@@ -318,6 +346,93 @@ def redraw_all(ws, contexts, *args, message=None, **kwargs):
             message_feedback(ws, context, *message)
         else:
             feedback(ws, context, *args, **kwargs)
+
+
+def key_svg(label, value, color, label_color=DIM):
+    """One 144px key: a small label on top, gray unless said otherwise, the big value under it."""
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144" font-family="{FONT}">'
+        f'<rect width="144" height="144" fill="{BLACK}"/>'
+        f'<text x="72" y="38" fill="{label_color}" font-size="20" font-weight="600" text-anchor="middle">{label}</text>'
+        f'<text x="72" y="88" fill="{color}" font-size="38" font-weight="600" text-anchor="middle">{value}</text>'
+        "</svg>"
+    )
+
+
+def key_temp(settings):
+    # The temp comes from the key's settings page as text ("140"), or not
+    # at all on a key I just dragged on. Anything that isn't one of the
+    # dial's presets means my default, so a key can never ask the mug for
+    # a temp the dial can't show.
+    try:
+        value = int(settings.get("temp"))
+    except (AttributeError, TypeError, ValueError):
+        return DEFAULT_TEMP
+    return value if value in PRESETS else DEFAULT_TEMP
+
+
+def key_picture(action, settings, state, target, notice=None):
+    """What a key shows, from the mug's status and the temp I've picked."""
+    connected = state.get("connected") is True and not status_is_stale(state)
+    target = target or 0
+    heating = target >= 1
+    current = finite_number(state.get("current_f"))
+    now_text = "—" if current is None else f"{round(current):d}°"
+    if action == TEMP:
+        temp = key_temp(settings)
+        if notice:
+            # "Sent" until the mug says it's set, or "Not applied" when
+            # it never does, so a press always gets an answer.
+            return key_svg(notice, f"{temp}°", WHITE)
+        if not connected:
+            return key_svg("Offline", f"{temp}°", DIM)
+        return key_svg("Temp", f"{temp}°", PINK if heating and round(target) == temp else WHITE)
+    if not heating:
+        # Off is off, same as the dial: the sleeping mug, connected or
+        # not, instead of the drink cooling down degree by degree.
+        return SLEEPING_KEY
+    if not connected:
+        return key_svg("Offline" if action == POWER else "Ember", "—", DIM)
+    if current is not None and not is_at_target(state, target):
+        # While the drink is still getting to its temp, the label on On/Off
+        # and Ember Page is the dial's arrow: which way it's going says more
+        # than "On" or "Ember" does. Once it's there, the word comes back.
+        warming = current < target
+        return key_svg("▲" if warming else "▼", now_text, PINK, WARMING if warming else COOLING)
+    return key_svg("On" if action == POWER else "Ember", now_text, PINK)
+
+
+def draw_keys(ws, keys, state=None, now=None):
+    # Only a picture that changed gets sent. These redraw every couple of
+    # seconds, and the deck chokes when it's sent the same picture over
+    # and over. With no keys showing there's nothing to read status for.
+    if not keys:
+        return
+    state = status() if state is None else state
+    now = time.monotonic() if now is None else now
+    mug_target = target_f(state)
+    for context, key in list(keys.items()):
+        notice = key.get("notice")
+        if notice == "Sent" and mug_target >= 1 and round(mug_target) == key_temp(key["settings"]):
+            # The mug reports the temp this key sent: that's the yes.
+            notice = key["notice"] = None
+        elif notice == "Not applied" and now >= key.get("notice_until", 0):
+            notice = key["notice"] = None
+        svg = key_picture(key["action"], key["settings"], state, selected, notice)
+        if key.get("drawn") == svg:
+            continue
+        key["drawn"] = svg
+        image = "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+        ws.send({"event": "setImage", "context": context, "payload": {"image": image, "target": 0}})
+
+
+def deck_kinds(info):
+    """Every deck in Stream Deck's -info, as {id: kind of deck}."""
+    try:
+        devices = json.loads(info).get("devices", [])
+        return {device["id"]: device.get("type") for device in devices}
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {}
 
 
 def send_temp_command(ws, context, fahrenheit):
@@ -344,7 +459,14 @@ def main():
     register_event = arg("-registerEvent")
     ws = WebSocket(port)
     ws.send({"event": register_event, "uuid": plugin_uuid})
+    # The Ember Page key opens a page made for the kind of deck it's on, so
+    # I keep track of which kind each one is. Stream Deck lists them at startup and says
+    # when one is plugged in or pulled out.
+    decks = deck_kinds(arg("-info"))
     contexts = set()
+    # Keys on screen: {context: {"action", "settings", "drawn"}}. Dials stay
+    # in contexts, because everything the dial does is built on that set.
+    keys = {}
     # Stream Deck gives each placed action its own context. Keeping one start
     # time per context prevents presses on different dials from interfering.
     press_started = {}
@@ -363,6 +485,28 @@ def main():
     checkmark_until = 0.0
     was_at_target = None
     last_update = 0.0
+
+    def choose(new_selection, now, sent_from=None):
+        # Every way of picking a temp, a turn, a push or a key, leaves the
+        # same trail: what I asked for and when, so "not applied" can check
+        # it later, and a clean slate for the check mark. A new choice
+        # replaces any old "Sent" on the keys, and sent_from is the Set Temp
+        # key that made this one. The keys redraw right away so a turn of
+        # the dial shows on them too.
+        global selected, last_action
+        nonlocal pending_selection, not_applied_until, checkmark_until, was_at_target
+        selected = new_selection
+        pending_selection = new_selection
+        not_applied_until = 0.0
+        checkmark_until = 0.0
+        was_at_target = False
+        last_action = now
+        for key in keys.values():
+            key["notice"] = None
+        if sent_from in keys:
+            keys[sent_from]["notice"] = "Sent"
+        draw_keys(ws, keys, now=now)
+
     while True:
         try:
             event = ws.receive()
@@ -372,14 +516,57 @@ def main():
         if event:
             name = event.get("event")
             context = event.get("context")
-            if name == "willAppear" and context:
+            action = event.get("action")
+            settings = event.get("payload", {}).get("settings") or {}
+            if name == "willAppear" and context and action in KEY_ACTIONS:
+                keys[context] = {"action": action, "settings": settings}
+                sync_selection()
+                draw_keys(ws, {context: keys[context]})
+            elif name == "willAppear" and context:
                 contexts.add(context)
                 sync_selection()
                 was_at_target = is_at_target(status(), selected)
                 feedback(ws, context, selected)
             elif name == "willDisappear" and context:
                 contexts.discard(context)
+                keys.pop(context, None)
                 press_started.pop(context, None)
+            elif name == "didReceiveSettings" and context in keys:
+                # A new temp picked on the settings page shows straight away.
+                keys[context]["settings"] = settings
+                draw_keys(ws, {context: keys[context]})
+            elif name == "deviceDidConnect":
+                decks[event.get("device")] = event.get("deviceInfo", {}).get("type")
+            elif name == "deviceDidDisconnect":
+                decks.pop(event.get("device"), None)
+            elif name == "keyDown" and context in keys:
+                key = keys[context]
+                if key["action"] == OPEN:
+                    # A plugin can only open pages it ships with, and I only
+                    # made them for my XL and my +, so any other deck gets the
+                    # alert triangle instead of a page that doesn't fit.
+                    device = event.get("device")
+                    page = PAGES.get(decks.get(device))
+                    if page:
+                        ws.send({"event": "switchToProfile", "context": plugin_uuid, "device": device, "payload": {"profile": page}})
+                    else:
+                        ws.send({"event": "showAlert", "context": context})
+                    continue
+                if key["action"] == TEMP:
+                    new_selection = key_temp(key["settings"])
+                else:
+                    new_selection = 0 if selected and selected >= 1 else DEFAULT_TEMP
+                try:
+                    set_temp(new_selection)
+                except OSError:
+                    # A key has no room for "COMMAND FAILED", so it gets
+                    # Stream Deck's own alert triangle and the log keeps why.
+                    log.exception("Could not write command.json")
+                    ws.send({"event": "showAlert", "context": context})
+                    last_update = now
+                    continue
+                choose(new_selection, now, sent_from=context if key["action"] == TEMP else None)
+                redraw_all(ws, contexts, selected)
             elif name == "dialRotate" and context:
                 ticks = int(event.get("payload", {}).get("ticks", 0))
                 if ticks:
@@ -394,13 +581,8 @@ def main():
                     if not send_temp_command(ws, context, new_selection):
                         last_update = now
                         continue
-                    selected = new_selection
-                    pending_selection = new_selection
-                    not_applied_until = 0.0
-                    last_action = now
-                    target_preview_until = last_action + TARGET_PREVIEW_SECONDS
-                    checkmark_until = 0.0
-                    was_at_target = False
+                    choose(new_selection, now)
+                    target_preview_until = now + TARGET_PREVIEW_SECONDS
                     feedback(ws, context, selected, target_only=True)
             elif name == "dialDown" and context:
                 # Do not toggle heating yet. We must wait for dial-up so a
@@ -433,15 +615,11 @@ def main():
                 else:
                     # A short press keeps the original behavior: turn heating
                     # off, or turn it back on at the default of 145°F.
-                    new_selection = 0 if selected and selected >= 1 else 145
+                    new_selection = 0 if selected and selected >= 1 else DEFAULT_TEMP
                     if not send_temp_command(ws, context, new_selection):
                         last_update = now
                         continue
-                    selected = new_selection
-                    pending_selection = new_selection
-                    not_applied_until = 0.0
-                    checkmark_until = 0.0
-                    was_at_target = False
+                    choose(new_selection, now)
                     feedback(ws, context, selected)
         if checkmark_until and now >= checkmark_until:
             # The target-reached check is a brief confirmation, not a
@@ -464,10 +642,10 @@ def main():
             last_update = now
             continue
         if now - last_update >= STATUS_REFRESH_SECONDS:
-            # With no dial on screen there is nothing to draw, so skip the
-            # status.json read. willAppear syncs everything again when a
-            # dial comes back.
-            if not contexts:
+            # With no dial or key on screen there is nothing to draw, so
+            # skip the status.json read. willAppear syncs everything again
+            # when one comes back.
+            if not contexts and not keys:
                 # Nobody is watching, so nobody should get a verdict on a
                 # command from before they left.
                 pending_selection = None
@@ -478,6 +656,9 @@ def main():
             if target_preview_until:
                 continue
             current_status = status()
+            # Keys only show the plain truth, so they skip the dial's
+            # reconnecting and "not applied" screens below.
+            draw_keys(ws, keys, current_status)
             if reconnect_requested_at is not None:
                 updated_at = finite_number(current_status.get("updated_ts")) or 0.0
                 status_is_fresh = updated_at >= reconnect_requested_at
@@ -513,6 +694,12 @@ def main():
                     if selected != pending_selection:
                         not_applied_until = now + NOT_APPLIED_MESSAGE_SECONDS
                         redraw_all(ws, contexts, message=("NOT APPLIED", "TRY AGAIN"))
+                        # The Set Temp key still saying "Sent" gets the same news.
+                        for key in keys.values():
+                            if key.get("notice") == "Sent":
+                                key["notice"] = "Not applied"
+                                key["notice_until"] = not_applied_until
+                        draw_keys(ws, keys, current_status, now)
                         pending_selection = None
                         last_update = now
                         continue
