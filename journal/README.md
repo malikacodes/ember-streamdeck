@@ -14,3 +14,4 @@ This is the part where I keep the real story of building this project. Not just 
 | 08 | October 17, 2026 | [Two seconds of nothing](08-two-seconds-of-nothing.md) |
 | 09 | October 17, 2026 | [The dial that changes its mind](09-the-dial-that-changes-its-mind.md) |
 | 10 | October 17, 2026 | [Saying things once](10-saying-things-once.md) |
+| 11 | October 27, 2026 | [The mug gets keys](11-the-mug-gets-keys.md) |
