@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <script src="sdpi-components.js"></script>
+  </head>
+  <body>
+    <!-- The temp a press sets the mug to. Same four as the dial, so the
+         dial can always show what a key picked. A key I just dragged on
+         hasn't saved anything yet, and the plugin treats that as 145. -->
+    <sdpi-item label="Temperature">
+      <sdpi-select setting="temp" default="145">
+        <option value="120">120°F</option>
+        <option value="130">130°F</option>
+        <option value="140">140°F</option>
+        <option value="145">145°F</option>
+      </sdpi-select>
+    </sdpi-item>
+  </body>
+</html>

@@ -154,6 +154,8 @@ Rotation moves through:
 120°F ↔ 130°F ↔ 140°F ↔ 145°F
 ```
 
+Pushing the dial down while I turn it moves one degree per click instead, anywhere from 120°F to 145°F, for when 140 is a little too hot and 130 is a little too sad. Letting go after a push-and-turn doesn't count as a press, so it never turns heating off or starts a reconnect by accident. A plain turn from an in-between temperature like 137°F goes to the next preset that way.
+
 Pressing toggles:
 
 ```text
@@ -168,11 +170,27 @@ HEATING · 78% ⚡
   120°  ▲  145°
 ```
 
-The up arrow is red while the mug is heating, and the down arrow is blue while it is cooling. While I turn the dial, the screen briefly shows only the target I am choosing. At the target, a check mark appears for three seconds and then leaves the clean temperature number. When heating is off, the screen simply says **OFF** without an arrow. The lightning bolt appears while the mug is charging.
+The up arrow is red while the mug is heating, and the down arrow is blue while it is cooling. While I turn the dial, the screen briefly shows only the target I am choosing. At the target, a check mark appears for three seconds and then leaves the clean temperature number. The lightning bolt appears while the mug is charging.
 
-If the mug is offline and heating is off, the screen used to say **OFFLINE** over **OFF**. Now it shows one sleeping mug instead. If only one of those is true, the text stays, because the battery or the target is still worth reading.
+When heating is off, the screen shows a sleeping mug, connected or not. Off is off: I don't need to watch my drink cool down one degree at a time. If the mug is offline but heating is still on, the text stays, because the target is still worth reading.
 
 Holding the dial for 1.5 seconds asks the Ember menu-bar app to reconnect. The screen shows **RECONNECTING**, then briefly confirms **CONNECTED** when fresh mug data arrives.
+
+## The keys
+
+The dial only fits on a dial. Stream Deck's **Action Wheel** (one dial that scrolls through a list of key actions) only takes keys, and my XL has no dials at all. So the mug has three keys too:
+
+| Key | Shows | Press |
+|---|---|---|
+| **Ember On/Off** | the drink's temperature right now in pink, under the dial's red ▲ or blue ▼ while it's still getting there ("On" once it is), or the sleeping mug when heating is off | heating off, or back on at 145°F |
+| **Ember Set Temp** | its own temperature, pink when the mug is set to it | sets the mug to that temperature |
+| **Ember Page** | same as On/Off, with "Ember" on top once the drink is there | opens the Ember page on my XL or my + |
+
+Set Temp's temperature is picked on its settings page, from the same four the dial uses. A new key starts at 145°F. A press always answers: the label says **Sent** until the mug reports the new temperature, then the number turns pink. If the mug never takes it, the label says **Not applied** for three seconds, the same moment the dial does. The keys say **Offline** when the app has no fresh news from the mug.
+
+The dial and the keys share one choice, so pressing **130°** on a key moves the dial to 130°F too, and turning the dial lights up the matching key.
+
+Ember Page opens the page made for the deck it's on. The XL page has Home, On/Off and the four temperatures along the top. The + page has On/Off and Home on top, the four temperatures underneath, and the Ember dial. Any other deck gets Stream Deck's alert triangle.
 
 ## Project files
 
@@ -182,18 +200,29 @@ com.embermug.dial.sdPlugin/
 ├── plugin.py
 ├── layouts/
 │   └── temperature.json
+├── ui/
+│   ├── temp.html
+│   └── sdpi-components.js
 └── imgs/
     ├── ember.svg
     ├── sleeping-mug.svg
+    ├── sleeping-mug-key.svg
+    ├── key.svg, power.svg, temp.svg, page.svg
     ├── category-icon.png / category-icon@2x.png
     └── plugin-icon.png / plugin-icon@2x.png
+scripts/
+├── profiles.py
+└── home.svg
 ```
 
 - `manifest.json` tells Stream Deck the plugin's name, ID, supported controls, entry point, and display layout.
-- `plugin.py` listens for dial events, reads mug status, writes commands, and updates the display.
+- `plugin.py` listens for dial and key events, reads mug status, writes commands, and updates the display.
+- `ui/temp.html` is Set Temp's settings page. `sdpi-components.js` is Elgato's kit for building those pages.
+- `imgs/key.svg` is what a key shows for the split second before the plugin draws it. The other three are the small icons in Stream Deck's action list.
+- `scripts/profiles.py` builds the Ember pages for my XL and my +. `home.svg` is the picture on their Home keys.
 - `layouts/temperature.json` defines the touch-screen layout: the text fields, plus one picture slot for the sleeping mug.
 - `imgs/ember.svg` is used for the action artwork, not on the physical dial display.
-- `imgs/sleeping-mug.svg` is the picture the dial shows when the mug is offline and heating is off.
+- `imgs/sleeping-mug.svg` is the picture the dial shows whenever heating is off, and `sleeping-mug-key.svg` is the same mug sized for a key.
 - `imgs/category-icon.png` and `imgs/category-icon@2x.png` identify the Ember Mug group in Stream Deck's action list.
 - `imgs/plugin-icon.png` and `imgs/plugin-icon@2x.png` are the two plugin-icon sizes required by Stream Deck.
 
@@ -201,7 +230,7 @@ com.embermug.dial.sdPlugin/
 
 - macOS 12 or newer
 - Elgato Stream Deck software 6.5 or newer
-- A Stream Deck model with a dial and touch strip
+- A Stream Deck + for the dial. Any Stream Deck works for the keys, and the Ember pages are for an XL and a +
 - The Ember Mug menu-bar app installed and running
 - The mug paired with the Mac and available over Bluetooth
 
@@ -214,7 +243,23 @@ cp -R com.embermug.dial.sdPlugin \
   "$HOME/Library/Application Support/com.elgato.StreamDeck/Plugins/"
 ```
 
-Then fully quit and reopen Stream Deck. Find **Ember Mug** in the action list and drag **Ember Temperature** onto a dial.
+Then fully quit and reopen Stream Deck. Find **Ember Mug** in the action list and drag **Ember Temperature** onto a dial, or the keys onto keys.
+
+The Ember pages aren't in the repo, because their Home keys point at my own Home profiles, and those ids only mean something on my Mac. Build them, then open each one once so Stream Deck imports it:
+
+```bash
+python3 scripts/profiles.py
+```
+
+```bash
+open com.embermug.dial.sdPlugin/profiles/ember-xl.streamDeckProfile
+```
+
+```bash
+open com.embermug.dial.sdPlugin/profiles/ember-plus.streamDeckProfile
+```
+
+Stream Deck only installs a plugin's bundled pages on a fresh install, so a copied-over plugin never gets it by itself. Opening the file by hand is the way in.
 
 The plugin expects the Ember menu-bar app to keep its support files in:
 
@@ -245,4 +290,4 @@ This is an unofficial personal project. It is not affiliated with or endorsed by
 
 I wanted to control my Ember Mug with a Stream Deck dial. The first Python library could change the temperature, but reconnecting to the mug for every command was unreliable. I used a macOS menu-bar app to keep the Bluetooth connection running, then built this Stream Deck plugin to send commands to that app.
 
-Turning the dial moves between **120°F, 130°F, 140°F, and 145°F**. Pressing it turns heating off, and pressing it again turns heating back on at my default of **145°F**. Holding it reconnects the mug. The Stream Deck screen also shows the current and target temperatures, heating or cooling direction, battery percentage, and whether the mug is charging.
+Turning the dial moves between **120°F, 130°F, 140°F, and 145°F**, and pushing while turning moves one degree at a time. Pressing it turns heating off, and pressing it again turns heating back on at my default of **145°F**. Holding it reconnects the mug. The Stream Deck screen also shows the current and target temperatures, heating or cooling direction, battery percentage, and whether the mug is charging.
