@@ -19,7 +19,7 @@
       "UUID": "com.embermug.dial.power",
       "Name": "Ember On/Off",
       "Icon": "imgs/power",
-      "Tooltip": "Shows the mug's temp. Press to turn heating on or off.",
+      "Tooltip": "Shows the mug's temp. Press to turn heating on or off. Hold to reconnect.",
       "Controllers": ["Keypad"],
       "UserTitleEnabled": false,
       "States": [{ "Image": "imgs/key" }]
@@ -39,6 +39,15 @@
       "Name": "Ember Page",
       "Icon": "imgs/page",
       "Tooltip": "Shows the mug's temp. Press to open the Ember page on this deck (XL or +).",
+      "Controllers": ["Keypad"],
+      "UserTitleEnabled": false,
+      "States": [{ "Image": "imgs/key" }]
+    },
+    {
+      "UUID": "com.embermug.dial.app",
+      "Name": "Ember App",
+      "Icon": "imgs/app",
+      "Tooltip": "Press to quit the Ember app, or open it when it's closed. Hold to reconnect.",
       "Controllers": ["Keypad"],
       "UserTitleEnabled": false,
       "States": [{ "Image": "imgs/key" }]
@@ -69,5 +78,5 @@
   "SDKVersion": 2,
   "Software": { "MinimumVersion": "6.5" },
   "UUID": "com.embermug.dial",
-  "Version": "1.2.0.0"
+  "Version": "1.3.0.0"
 }

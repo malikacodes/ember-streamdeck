@@ -23,6 +23,7 @@ NOT_APPLIED_MESSAGE_SECONDS = 3
 STATUS_REFRESH_SECONDS = 2 # How often the dial redraws from status.json
 SELECTION_SETTLE_SECONDS = 3 # After a dial action, wait this long before trusting status.json over my choice
 STATUS_STALE_SECONDS = 300
+APP_CHECK_SECONDS = 30 # How long one "is the app still running?" answer is trusted
 HANDSHAKE_SECONDS = 30 # How long to wait for Stream Deck to answer the plugin's hello
 PREVIEW_GAP_SECONDS = 0.1 # A spinning dial draws at most this often (ten a second)
 SUPPORT = Path.home() / "Library/Application Support/EmberMug"
@@ -34,16 +35,20 @@ SLEEPING_MUG = "imgs/sleeping-mug.svg" # Shown on the dial whenever heating is o
 SLEEPING_KEY = (Path(__file__).parent / "imgs/sleeping-mug-key.svg").read_text(encoding="utf-8")
 LOG_FILE = Path.home() / "Library/Logs/EmberMug/plugin.log"
 EMBER_APP = Path.home() / "Applications/Ember Mug.app"
+# The app's launcher starts this script in the background and exits, so
+# the script's name is how to find (and quit) the running app.
+APP_SCRIPT = "ember_mug_app.py"
 log = logging.getLogger("embermug")
 
-# The four things I can put on the deck. The dial is the original. The
+# The five things I can put on the deck. The dial is the original. The
 # keys are for places a dial can't go: the Action Wheel (it only takes
 # key actions) and my XL, which has no dials at all.
 DIAL = "com.embermug.dial.temperature"
 POWER = "com.embermug.dial.power"
 TEMP = "com.embermug.dial.temp"
 OPEN = "com.embermug.dial.open"
-KEY_ACTIONS = (POWER, TEMP, OPEN)
+APP = "com.embermug.dial.app"
+KEY_ACTIONS = (POWER, TEMP, OPEN, APP)
 DEFAULT_TEMP = 145 # My favorite. On/Off turns heating back on here, same as the dial
 # The page the Ember Page key opens, by Stream Deck's number for the kind
 # of deck: 2 is the XL, 7 is the +. Both are bundled with the plugin.
@@ -67,6 +72,8 @@ last_action = 0.0  # Time of the most recent dial action
 # Stream Deck takes about ten pictures a second for the whole plugin, and
 # the two second refresh was spending some of them on nothing.
 strips_shown = {}
+# The last answer to "is the app still running?" and when it was asked.
+app_checked = {"at": None, "running": False}
 
 
 def setup_logging():
@@ -122,10 +129,23 @@ def status_is_stale(state, now=None):
     if state.get("connected") is not True:
         return False
     updated_at = finite_number(state.get("updated_ts"))
-    if updated_at is None:
-        return True
     now = time.time() if now is None else now
-    return now - updated_at > STATUS_STALE_SECONDS
+    if updated_at is not None and now - updated_at <= STATUS_STALE_SECONDS:
+        return False
+    # The app only rewrites status.json when something changes, so a mug
+    # sitting steady at its temp goes quiet for minutes at a time. An old
+    # file only means trouble if the app that wrote it is gone.
+    return not app_still_running()
+
+
+def app_still_running():
+    # A quiet mug asks this on every two second refresh, so one answer is
+    # kept for APP_CHECK_SECONDS instead of running pgrep every time.
+    now = time.monotonic()
+    if app_checked["at"] is None or now - app_checked["at"] >= APP_CHECK_SECONDS:
+        app_checked["at"] = now
+        app_checked["running"] = app_running()
+    return app_checked["running"]
 
 
 def set_temp(fahrenheit):
@@ -140,6 +160,32 @@ def request_reconnect():
     if not EMBER_APP.is_dir():
         raise FileNotFoundError(f"Ember app not found: {EMBER_APP}")
     subprocess.Popen(["open", str(EMBER_APP)])
+
+
+def app_running():
+    # If pgrep itself fails, saying "not running" is the safe guess: the
+    # App key then opens the app, and the launcher replaces any copy that
+    # was running after all.
+    try:
+        return subprocess.run(["pgrep", "-f", APP_SCRIPT], capture_output=True, timeout=3).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def quit_app():
+    # The app has no quit command in command.json, so this stops it the
+    # same way its own launcher does before starting a fresh copy. Its
+    # menu's Quit also deletes status.json, so I do that too once it's
+    # gone. Otherwise the dial would keep reading the last status it wrote.
+    subprocess.run(["pkill", "-f", APP_SCRIPT], capture_output=True, timeout=3)
+    for _ in range(20):
+        if not app_running():
+            break
+        time.sleep(0.1)
+    try:
+        STATUS.unlink()
+    except FileNotFoundError:
+        pass
 
 
 class WebSocket:
@@ -408,8 +454,19 @@ def key_picture(action, settings, state, target, notice=None):
             # it never does, so a press always gets an answer.
             return key_svg(notice, f"{temp}°", WHITE)
         if not connected:
-            return key_svg("Offline", f"{temp}°", DIM)
+            # No status at all means I quit the app on purpose, which is
+            # off, not offline.
+            return key_svg("Offline" if state else "Off", f"{temp}°", DIM)
         return key_svg("Temp", f"{temp}°", PINK if heating and round(target) == temp else WHITE)
+    if notice:
+        # "Connecting" after a hold, until the app says it's back.
+        return key_svg(notice, "…", WHITE)
+    if action == APP:
+        # The app writes status.json the whole time it runs and deletes it
+        # when it quits, so no status at all means the app is off.
+        if not state:
+            return key_svg("App", "Off", DIM)
+        return key_svg("App", "On", PINK if connected else WHITE)
     if not heating:
         # Off is off, same as the dial: the sleeping mug, connected or
         # not, instead of the drink cooling down degree by degree.
@@ -566,6 +623,70 @@ def main():
         if not turning:
             draw_keys(ws, keys, now=now)
 
+    def reconnect(now, context):
+        # Holding the dial, holding On/Off and the App key all land here.
+        # Opening the app runs its launcher, which starts a fresh copy.
+        # When it can't, this returns what went wrong for the dial's strip.
+        nonlocal reconnect_requested_at, reconnect_started_at
+        try:
+            request_reconnect()
+        except FileNotFoundError:
+            log.exception("Ember app not found")
+            return "APP NOT FOUND", "REINSTALL APP"
+        except OSError:
+            log.exception("Could not open the Ember app")
+            return "RECONNECT FAILED", "TRY AGAIN"
+        # Wait for a status update newer than this request. That
+        # prevents stale "connected" data from confirming too soon.
+        reconnect_requested_at = time.time()
+        reconnect_started_at = now
+        redraw_all(ws, contexts, message=("RECONNECTING…", "…"))
+        if context in keys:
+            keys[context]["notice"] = "Connecting"
+            draw_keys(ws, keys, now=now)
+        return None
+
+    def reconnect_over(current_status, now):
+        # Connected or given up, the keys drop "Connecting" either way.
+        nonlocal reconnect_requested_at, reconnect_started_at
+        reconnect_requested_at = None
+        reconnect_started_at = None
+        for key in keys.values():
+            if key.get("notice") == "Connecting":
+                key["notice"] = None
+        draw_keys(ws, keys, current_status, now)
+
+    def quit_ember(now, context):
+        # Off means nothing is waiting on the app anymore: no reconnect,
+        # no command to check. Every dial and key shows off straight away.
+        nonlocal pending_selection
+        try:
+            quit_app()
+        except (OSError, subprocess.TimeoutExpired):
+            log.exception("Could not quit the Ember app")
+            ws.send({"event": "showAlert", "context": context})
+            return
+        pending_selection = None
+        sync_selection({})
+        for key in keys.values():
+            key["notice"] = None
+        reconnect_over({}, now)
+        redraw_all(ws, contexts, selected, state={})
+
+    def send_from_key(context, new_selection, now, sent_from=None):
+        nonlocal last_update
+        try:
+            set_temp(new_selection)
+        except OSError:
+            # A key has no room for "COMMAND FAILED", so it gets
+            # Stream Deck's own alert triangle and the log keeps why.
+            log.exception("Could not write command.json")
+            ws.send({"event": "showAlert", "context": context})
+            last_update = now
+            return
+        choose(new_selection, now, sent_from=sent_from)
+        redraw_all(ws, contexts, selected)
+
     while True:
         try:
             event = ws.receive()
@@ -605,6 +726,11 @@ def main():
                 decks.pop(event.get("device"), None)
             elif name == "keyDown" and context in keys:
                 key = keys[context]
+                if key["action"] in (POWER, APP):
+                    # These two wait for letting go, like the dial, so a
+                    # hold can mean reconnect instead of a press.
+                    press_started[context] = now
+                    continue
                 if key["action"] == OPEN:
                     # A plugin can only open pages it ships with, and I only
                     # made them for my XL and my +, so any other deck gets the
@@ -616,21 +742,26 @@ def main():
                     else:
                         ws.send({"event": "showAlert", "context": context})
                     continue
-                if key["action"] == TEMP:
-                    new_selection = key_temp(key["settings"])
-                else:
-                    new_selection = 0 if selected and selected >= 1 else DEFAULT_TEMP
-                try:
-                    set_temp(new_selection)
-                except OSError:
-                    # A key has no room for "COMMAND FAILED", so it gets
-                    # Stream Deck's own alert triangle and the log keeps why.
-                    log.exception("Could not write command.json")
-                    ws.send({"event": "showAlert", "context": context})
-                    last_update = now
+                send_from_key(context, key_temp(key["settings"]), now, sent_from=context)
+            elif name == "keyUp" and context in keys:
+                started = press_started.pop(context, None)
+                if started is None:
                     continue
-                choose(new_selection, now, sent_from=context if key["action"] == TEMP else None)
-                redraw_all(ws, contexts, selected)
+                held = now - started >= HOLD_SECONDS
+                if keys[context]["action"] == APP:
+                    # A press quits the app when it's running. Otherwise,
+                    # and on a hold, it opens or reconnects. Holding On/Off
+                    # never quits: off is the App key's job only.
+                    if not held and app_running():
+                        quit_ember(now, context)
+                    elif reconnect(now, context):
+                        ws.send({"event": "showAlert", "context": context})
+                elif held:
+                    if reconnect(now, context):
+                        ws.send({"event": "showAlert", "context": context})
+                else:
+                    # Off from any temp, back on at 145, same as a dial push.
+                    send_from_key(context, 0 if selected and selected >= 1 else DEFAULT_TEMP, now)
             elif name == "dialRotate" and context:
                 payload = event.get("payload", {})
                 ticks = int(payload.get("ticks", 0))
@@ -666,23 +797,11 @@ def main():
                 held_for = now - started
                 last_action = now
                 if held_for >= HOLD_SECONDS:
-                    try:
-                        request_reconnect()
-                    except FileNotFoundError:
-                        log.exception("Ember app not found")
-                        message_feedback(ws, context, "APP NOT FOUND", "REINSTALL APP")
+                    failed = reconnect(now, context)
+                    if failed:
+                        message_feedback(ws, context, *failed)
                         last_update = now
                         continue
-                    except OSError:
-                        log.exception("Could not open the Ember app")
-                        message_feedback(ws, context, "RECONNECT FAILED", "TRY AGAIN")
-                        last_update = now
-                        continue
-                    # Wait for a status update newer than this request. That
-                    # prevents stale "connected" data from confirming too soon.
-                    reconnect_requested_at = time.time()
-                    reconnect_started_at = now
-                    message_feedback(ws, context, "RECONNECTING…", "…")
                 else:
                     # A short press keeps the original behavior: turn heating
                     # off, or turn it back on at the default of 145°F.
@@ -742,15 +861,13 @@ def main():
                 updated_at = finite_number(current_status.get("updated_ts")) or 0.0
                 status_is_fresh = updated_at >= reconnect_requested_at
                 if current_status.get("connected") is True and status_is_fresh:
-                    reconnect_requested_at = None
-                    reconnect_started_at = None
+                    reconnect_over(current_status, now)
                     connected_message_until = now + CONNECTED_MESSAGE_SECONDS
                     sync_selection(current_status)
                 elif now - reconnect_started_at >= RECONNECT_TIMEOUT_SECONDS:
                     # Stop showing an endless reconnect message. The normal
                     # feedback will explain that the mug is still offline.
-                    reconnect_requested_at = None
-                    reconnect_started_at = None
+                    reconnect_over(current_status, now)
                 else:
                     redraw_all(ws, contexts, message=("RECONNECTING…", "…"))
                     last_update = now
