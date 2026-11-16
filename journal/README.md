@@ -15,3 +15,4 @@ This is the part where I keep the real story of building this project. Not just 
 | 09 | October 17, 2026 | [The dial that changes its mind](09-the-dial-that-changes-its-mind.md) |
 | 10 | October 17, 2026 | [Saying things once](10-saying-things-once.md) |
 | 11 | October 27, 2026 | [The mug gets keys](11-the-mug-gets-keys.md) |
+| 12 | October 27, 2026 | [A key for leaving it alone](12-a-key-for-leaving-it-alone.md) |
