@@ -37,22 +37,23 @@ HOME_IMAGE = "home.png"
 # 0 at the top left.
 #
 # The XL has everything along the top row like my Mac Vitals XL page.
-# The + has On/Off top left, Home top right where it is on my other +
-# pages, the four temps underneath, and the Ember dial on the first dial.
+# The + has On/Off and App top left, Home top right where it is on my
+# other + pages, the four temps underneath, and the Ember dial on the
+# first dial.
 TEMPS = [("temp", {"temp": str(temp)}) for temp in (120, 130, 140, 145)]
 PAGES = {
     "ember-xl": {
         "name": "Ember XL",
         "model": "20GAT9901",
         "home": (0, 0),
-        "keys": [(1, 0, "power", {})] + [(2 + i, 0, *temp) for i, temp in enumerate(TEMPS)],
+        "keys": [(1, 0, "power", {})] + [(2 + i, 0, *temp) for i, temp in enumerate(TEMPS)] + [(6, 0, "app", {})],
         "dials": [],
     },
     "ember-plus": {
         "name": "Ember +",
         "model": "20GBD9901",
         "home": (3, 0),
-        "keys": [(0, 0, "power", {})] + [(i, 1, *temp) for i, temp in enumerate(TEMPS)],
+        "keys": [(0, 0, "power", {}), (1, 0, "app", {})] + [(i, 1, *temp) for i, temp in enumerate(TEMPS)],
         "dials": [(0, "temperature")],
     },
 }

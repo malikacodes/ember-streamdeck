@@ -178,19 +178,22 @@ Holding the dial for 1.5 seconds asks the Ember menu-bar app to reconnect. The s
 
 ## The keys
 
-The dial only fits on a dial. Stream Deck's **Action Wheel** (one dial that scrolls through a list of key actions) only takes keys, and my XL has no dials at all. So the mug has three keys too:
+The dial only fits on a dial. Stream Deck's **Action Wheel** (one dial that scrolls through a list of key actions) only takes keys, and my XL has no dials at all. So the mug has four keys too:
 
 | Key | Shows | Press |
 |---|---|---|
-| **Ember On/Off** | the drink's temperature right now in pink, under the dial's red ▲ or blue ▼ while it's still getting there ("On" once it is), or the sleeping mug when heating is off | heating off, or back on at 145°F |
+| **Ember On/Off** | the drink's temperature right now in pink, under the dial's red ▲ or blue ▼ while it's still getting there ("On" once it is), or the sleeping mug when heating is off | heating off, or back on at 145°F. Hold: reconnect |
 | **Ember Set Temp** | its own temperature, pink when the mug is set to it | sets the mug to that temperature |
 | **Ember Page** | same as On/Off, with "Ember" on top once the drink is there | opens the Ember page on my XL or my + |
+| **Ember App** | whether the Ember menu-bar app is running: **On** in pink when it's connected to the mug, gray **Off** when it's quit | quits the app, or opens it when it's closed. Hold: reconnect |
 
-Set Temp's temperature is picked on its settings page, from the same four the dial uses. A new key starts at 145°F. A press always answers: the label says **Sent** until the mug reports the new temperature, then the number turns pink. If the mug never takes it, the label says **Not applied** for three seconds, the same moment the dial does. The keys say **Offline** when the app has no fresh news from the mug.
+Set Temp's temperature is picked on its settings page, from the same four the dial uses. A new key starts at 145°F. A press always answers: the label says **Sent** until the mug reports the new temperature, then the number turns pink. If the mug never takes it, the label says **Not applied** for three seconds, the same moment the dial does. The keys say **Offline** when the app has lost the mug, or has gone quiet for five minutes and isn't running anymore (a mug sitting steady at its temp goes quiet too, so the plugin checks), and **Off** when I've quit the app.
 
 The dial and the keys share one choice, so pressing **130°** on a key moves the dial to 130°F too, and turning the dial lights up the matching key.
 
-Ember Page opens the page made for the deck it's on. The XL page has Home, On/Off and the four temperatures along the top. The + page has On/Off and Home on top, the four temperatures underneath, and the Ember dial. Any other deck gets Stream Deck's alert triangle.
+Ember Page opens the page made for the deck it's on. The XL page has Home, On/Off, the four temperatures and Ember App along the top. The + page has On/Off, Ember App and Home on top, the four temperatures underneath, and the Ember dial. Any other deck gets Stream Deck's alert triangle.
+
+Ember App is for when I'm not using the mug and want it left alone. Quitting the app is the only way the deck turns it off: holding On/Off only ever opens or reconnects, same as holding the dial. The app has no quit command of its own, so the plugin stops its script the way the app's launcher does, then deletes `status.json` like the app's own Quit would. With the app gone, the dial and On/Off show the sleeping mug. On/Off and Ember App wait for me to let go before doing anything, because that's the only way to tell a press from a hold. The XL page has Ember App at the end of the top row, and the + page has it next to On/Off.
 
 ## Project files
 

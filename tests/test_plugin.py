@@ -20,6 +20,7 @@ MANIFEST_PATH = PLUGIN_ROOT / "manifest.json"
 SPEC = importlib.util.spec_from_file_location("ember_streamdeck_plugin", PLUGIN_PATH)
 plugin = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(plugin)
+real_app_still_running = plugin.app_still_running
 
 
 class FakeSocket:
@@ -55,10 +56,14 @@ class FeedbackSocket:
 
 
 @pytest.fixture(autouse=True)
-def reset_plugin_state():
+def reset_plugin_state(monkeypatch):
     plugin.selected = None
     plugin.last_action = 0.0
     plugin.strips_shown.clear()
+    plugin.app_checked.update(at=None, running=False)
+    # No test should look for the real Ember app on this Mac. Old status
+    # counts as offline unless a test says the app is still running.
+    monkeypatch.setattr(plugin, "app_still_running", lambda: False)
 
 
 def load_manifest():
@@ -316,6 +321,32 @@ def test_arg_reads_stream_deck_command_line_flag(monkeypatch):
 )
 def test_status_staleness_uses_five_minute_threshold(state, now, expected):
     assert plugin.status_is_stale(state, now=now) is expected
+
+
+# A mug sitting steady at its temp leaves status.json alone for minutes.
+# That's only offline if the app is gone, not while it's still running.
+@pytest.mark.parametrize("state", [{"connected": True, "updated_ts": 0}, {"connected": True}])
+def test_old_status_is_fine_while_the_app_still_runs(monkeypatch, state):
+    monkeypatch.setattr(plugin, "app_still_running", lambda: True)
+
+    assert plugin.status_is_stale(state, now=1_000) is False
+
+
+# The quiet-mug check runs pgrep at most once every 30 seconds, not on
+# every two second refresh.
+def test_app_check_is_reused_for_thirty_seconds(monkeypatch):
+    clock = Clock(100.0)
+    monkeypatch.setattr(plugin.time, "monotonic", clock)
+    answers = iter([True, False])
+    asked = Mock(side_effect=lambda: next(answers))
+    monkeypatch.setattr(plugin, "app_running", asked)
+
+    assert real_app_still_running() is True
+    clock.value = 129.9
+    assert real_app_still_running() is True
+    clock.value = 130.0
+    assert real_app_still_running() is False
+    assert asked.call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -815,7 +846,7 @@ class ScriptedWebSocket(FeedbackSocket):
             event = next(self.events)
         except StopIteration:
             raise EOFError
-        if self.clock is not None and event.get("event") in ("dialDown", "dialUp"):
+        if self.clock is not None and event.get("event") in ("dialDown", "dialUp", "keyDown", "keyUp"):
             self.clock.value = next(self.press_times, self.clock.value)
         return event
 
@@ -1861,10 +1892,9 @@ def mug(target, current=130, connected=True):
 
 
 def key_down(context, action, settings=None, device="plus-1"):
-    return [
-        {"event": "willAppear", "action": action, "context": context, "device": device, "payload": {"settings": settings or {}}},
-        {"event": "keyDown", "action": action, "context": context, "device": device, "payload": {"settings": settings or {}}},
-    ]
+    # A real press is a key down and a key up, so both get sent.
+    event = {"action": action, "context": context, "device": device, "payload": {"settings": settings or {}}}
+    return [{"event": "willAppear", **event}, {"event": "keyDown", **event}, {"event": "keyUp", **event}]
 
 
 def pictures(websocket, context):
@@ -2352,3 +2382,178 @@ def test_unchanged_strip_is_not_resent_until_the_dial_comes_back(monkeypatch):
     strips = [m for m in websocket.messages if m.get("event") == "setFeedback"]
     assert len(strips) == 2
     assert strips[0]["payload"] == strips[1]["payload"]
+
+
+# ---- Quitting and reopening the Ember app ----
+
+def labels(websocket, context):
+    return [re.search(r'font-size="20"[^>]*>([^<]*)<', svg).group(1) if svg != plugin.SLEEPING_KEY else "mug" for svg in pictures(websocket, context)]
+
+
+def app_events(context, action, held_for):
+    # A press that's down for held_for seconds, timed by the Clock.
+    event = {"action": action, "context": context, "payload": {"settings": {}}}
+    return [{"event": "willAppear", **event}, {"event": "keyDown", **event}, {"event": "keyUp", **event}], (1.0, 1.0 + held_for)
+
+
+# The App key reads the app from status.json: the app writes it the whole
+# time it runs and deletes it when it quits, so no status means off.
+def test_app_key_shows_off_when_the_app_is_quit_and_on_when_it_runs():
+    assert ">Off<" in plugin.key_picture(plugin.APP, {}, {}, 0)
+    assert plugin.PINK in plugin.key_picture(plugin.APP, {}, mug(145), 145)
+    running_offline = plugin.key_picture(plugin.APP, {}, mug(145, connected=False), 145)
+    assert ">On<" in running_offline and plugin.PINK not in running_offline
+
+
+# With the app quit on purpose, Set Temp says Off, not Offline, so a
+# key I turned off doesn't look broken.
+def test_set_temp_key_says_off_when_the_app_is_quit():
+    assert ">Off<" in plugin.key_picture(plugin.TEMP, {"temp": "140"}, {}, 0)
+    assert ">Offline<" in plugin.key_picture(plugin.TEMP, {"temp": "140"}, mug(140, connected=False), 140)
+
+
+# A press while the app runs quits it, and everything on the deck shows
+# off right away: the dial and On/Off get the sleeping mug, App says Off.
+def test_app_key_press_quits_a_running_app_and_everything_shows_off(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "status", lambda: mug(145))
+    monkeypatch.setattr(plugin, "app_running", lambda: True)
+    quit_app = Mock()
+    monkeypatch.setattr(plugin, "quit_app", quit_app)
+    reconnect = Mock()
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    events, times = app_events("app-1", plugin.APP, 0.2)
+    power = {"action": plugin.POWER, "context": "power-1", "payload": {"settings": {}}}
+
+    websocket = run_main_until_events_end(
+        monkeypatch, [{"event": "willAppear", "context": "dial-1"}, {"event": "willAppear", **power}, *events], times
+    )
+
+    quit_app.assert_called_once()
+    reconnect.assert_not_called()
+    assert labels(websocket, "app-1")[-1] == "App" and ">Off<" in pictures(websocket, "app-1")[-1]
+    assert pictures(websocket, "power-1")[-1] == plugin.SLEEPING_KEY
+    strips = [m["payload"] for m in websocket.messages if m.get("event") == "setFeedback"]
+    assert strips[-1]["mug"]["enabled"] is True
+    assert plugin.selected == 0
+
+
+# A press while the app is closed opens it, and the key says Connecting
+# until the app reports in.
+def test_app_key_press_opens_a_closed_app(monkeypatch):
+    monkeypatch.setattr(plugin, "status", lambda: {})
+    monkeypatch.setattr(plugin, "app_running", lambda: False)
+    quit_app = Mock()
+    monkeypatch.setattr(plugin, "quit_app", quit_app)
+    reconnect = Mock()
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    events, times = app_events("app-1", plugin.APP, 0.2)
+
+    websocket = run_main_until_events_end(monkeypatch, events, times)
+
+    reconnect.assert_called_once()
+    quit_app.assert_not_called()
+    assert labels(websocket, "app-1") == ["App", "Connecting"]
+
+
+# Holding App or On/Off reconnects, like holding the dial. Neither one
+# quits on a hold, and On/Off doesn't change the temp either.
+@pytest.mark.parametrize("action", [plugin.APP, plugin.POWER])
+def test_holding_app_or_on_off_reconnects_and_never_quits(monkeypatch, action):
+    plugin.selected = 145
+    # Written before the hold, so it can't count as the app reporting back.
+    monkeypatch.setattr(plugin, "status", lambda: {**mug(145), "updated_ts": 0.5})
+    monkeypatch.setattr(plugin, "app_running", lambda: True)
+    quit_app = Mock()
+    monkeypatch.setattr(plugin, "quit_app", quit_app)
+    reconnect = Mock()
+    monkeypatch.setattr(plugin, "request_reconnect", reconnect)
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    events, times = app_events("key-1", action, plugin.HOLD_SECONDS)
+
+    websocket = run_main_until_events_end(monkeypatch, [{"event": "willAppear", "context": "dial-1"}, *events], times)
+
+    reconnect.assert_called_once()
+    quit_app.assert_not_called()
+    set_temp.assert_not_called()
+    assert labels(websocket, "key-1")[-1] == "Connecting"
+    strips = [m["payload"] for m in websocket.messages if m.get("event") == "setFeedback"]
+    assert strips[-1]["title"] == "RECONNECTING…"
+
+
+# "Connecting" clears once the app writes a status newer than the hold.
+def test_connecting_clears_when_the_app_reports_in(monkeypatch):
+    plugin.selected = 145
+    clock = Clock()
+    monkeypatch.setattr(plugin, "status", lambda: {**mug(145), "updated_ts": clock.value})
+    monkeypatch.setattr(plugin, "request_reconnect", Mock())
+    press = {"action": plugin.POWER, "context": "key-1", "payload": {"settings": {}}}
+
+    websocket = run_timed_main(
+        monkeypatch,
+        [
+            (0.0, {"event": "willAppear", **press}),
+            (1.0, {"event": "keyDown", **press}),
+            (3.0, {"event": "keyUp", **press}),
+            (6.0, plugin.socket.timeout()),
+        ],
+        clock,
+    )
+
+    assert labels(websocket, "key-1") == ["▲", "Connecting", "▲"]
+
+
+# If Stream Deck never sends the key up, nothing fires. A key down alone
+# must not quit the app or flip the heating.
+def test_on_off_and_app_wait_for_letting_go(monkeypatch):
+    plugin.selected = 145
+    monkeypatch.setattr(plugin, "status", lambda: mug(145))
+    monkeypatch.setattr(plugin, "app_running", lambda: True)
+    quit_app = Mock()
+    monkeypatch.setattr(plugin, "quit_app", quit_app)
+    set_temp = Mock()
+    monkeypatch.setattr(plugin, "set_temp", set_temp)
+    events = []
+    for action, context in ((plugin.APP, "app-1"), (plugin.POWER, "power-1")):
+        event = {"action": action, "context": context, "payload": {"settings": {}}}
+        events += [{"event": "willAppear", **event}, {"event": "keyDown", **event}]
+
+    run_main_until_events_end(monkeypatch, events)
+
+    quit_app.assert_not_called()
+    set_temp.assert_not_called()
+
+
+# Quitting stops the app's script, waits for it to be gone, then deletes
+# status.json the way the app's own Quit does, so nothing reads the last
+# status it wrote as if it were still running.
+def test_quit_app_stops_the_script_then_deletes_its_status(tmp_path, monkeypatch):
+    status_file = tmp_path / "status.json"
+    status_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(plugin, "STATUS", status_file)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert kwargs["timeout"] == 3
+        # pgrep finds it once more right after pkill, then it's gone.
+        running = command[0] == "pgrep" and calls.count(command) == 1
+        return Mock(returncode=0 if running else 1)
+
+    monkeypatch.setattr(plugin.subprocess, "run", run)
+    monkeypatch.setattr(plugin.time, "sleep", lambda seconds: None)
+
+    plugin.quit_app()
+
+    assert calls[0] == ["pkill", "-f", "ember_mug_app.py"]
+    assert calls.count(["pgrep", "-f", "ember_mug_app.py"]) == 2
+    assert not status_file.exists()
+
+
+# If pgrep can't run, "not running" is the guess, so the App key opens
+# the app (the launcher replaces any copy that was running anyway).
+def test_app_running_guesses_not_running_when_pgrep_fails(monkeypatch):
+    monkeypatch.setattr(plugin.subprocess, "run", Mock(side_effect=OSError("no pgrep")))
+
+    assert plugin.app_running() is False
